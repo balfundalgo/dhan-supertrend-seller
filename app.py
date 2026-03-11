@@ -1,0 +1,1003 @@
+"""
+app.py — Balfund Supertrend Option Seller
+GUI application (CustomTkinter) that wraps the full strategy engine.
+
+Tabs:
+  1. Token Manager  — credentials + TOTP token generation
+  2. Strategy Setup — all parameters (variant, timeframe, ST, SL, rollover, etc.)
+  3. Live Dashboard — real-time candles, signals, option setup, paper P&L, event log
+"""
+from __future__ import annotations
+
+import os
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import customtkinter as ctk
+
+# ── Colour palette (Balfund dark theme) ──────────────────────────────────────
+DARK_BG   = "#0f1117"
+PANEL_BG  = "#1a1d27"
+CARD_BG   = "#20232f"
+BORDER    = "#2e3247"
+ACCENT    = "#e63946"
+ACCENT2   = "#4361ee"
+GREEN     = "#2dc653"
+RED       = "#e63946"
+YELLOW    = "#f4a261"
+WHITE     = "#f0f0f0"
+MUTED     = "#8b8fa8"
+FONT_MONO = ("Courier New", 11)
+FONT_SM   = ("Segoe UI", 10)
+FONT_MD   = ("Segoe UI", 12)
+FONT_LG   = ("Segoe UI", 14, "bold")
+FONT_XL   = ("Segoe UI", 18, "bold")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared strategy runtime bridge
+# ─────────────────────────────────────────────────────────────────────────────
+class StrategyBridge:
+    """Thread-safe bridge between GUI and running strategy engine."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._snapshot: Dict[str, Any] = {}
+        self._events: list[str] = []
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._snapshot)
+
+    def get_events(self) -> list[str]:
+        with self._lock:
+            return list(self._events)
+
+    def post_event(self, text: str) -> None:
+        now = datetime.now().strftime("%H:%M:%S")
+        with self._lock:
+            self._events.insert(0, f"[{now}] {text}")
+            self._events = self._events[:200]
+
+    def update_snapshot(self, data: Dict[str, Any]) -> None:
+        with self._lock:
+            self._snapshot = dict(data)
+
+    def start(self, cfg_kwargs: dict) -> str:
+        if self._running:
+            return "Already running"
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, args=(cfg_kwargs,), daemon=True
+        )
+        self._running = True
+        self._thread.start()
+        return "OK"
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._running = False
+
+    def _run(self, cfg_kwargs: dict) -> None:
+        try:
+            self._run_strategy(cfg_kwargs)
+        except Exception as e:
+            self.post_event(f"Strategy crashed: {e}")
+        finally:
+            self._running = False
+
+    def _run_strategy(self, kwargs: dict) -> None:
+        """
+        Imports and runs the strategy engine, continuously feeding
+        snapshots back to the bridge for the GUI to display.
+        """
+        # Set env vars from GUI credentials
+        os.environ["DHAN_CLIENT_ID"]    = kwargs.get("client_id", "")
+        os.environ["DHAN_PIN"]          = kwargs.get("pin", "")
+        os.environ["DHAN_TOTP_SECRET"]  = kwargs.get("totp_secret", "")
+        os.environ["DHAN_ACCESS_TOKEN"] = kwargs.get("access_token", "")
+
+        # Strategy config env overrides
+        os.environ["DEFAULT_TIMEFRAME_MINUTES"] = str(kwargs.get("timeframe", 60))
+        os.environ["DEFAULT_VARIANT"]           = str(kwargs.get("variant", 3))
+        os.environ["ST_PERIOD"]                 = str(kwargs.get("st_period", 10))
+        os.environ["ST_MULTIPLIER"]             = str(kwargs.get("st_multiplier", 3.0))
+        os.environ["SL_PERCENT"]                = str(kwargs.get("sl_percent", 30.0))
+        os.environ["OPTION_EXPIRY_MODE"]        = str(kwargs.get("expiry_mode", "AUTO"))
+        os.environ["OPTION_OTM_STEPS"]          = str(kwargs.get("otm_steps", "3,4,5,6"))
+        os.environ["ROLLOVER_VARIANT"]          = str(kwargs.get("rollover_variant", 2))
+        os.environ["MIN_SHORT_PREMIUM"]         = str(kwargs.get("min_short_premium", 200))
+        os.environ["MAX_SHORT_PREMIUM"]         = str(kwargs.get("max_short_premium", 300))
+        os.environ["MIN_HEDGE_PREMIUM"]         = str(kwargs.get("min_hedge_premium", 50))
+        os.environ["MAX_HEDGE_PREMIUM"]         = str(kwargs.get("max_hedge_premium", 90))
+        os.environ["MIN_NET_CREDIT"]            = str(kwargs.get("min_net_credit", 150))
+
+        from token_helper import ensure_dhan_token
+        from candle_builder import TimeframeCandleBuilder
+        from config import AppConfig
+        from dhan_ws_client import DhanWSClient
+        from history_loader import fetch_intraday_1m_history
+        from option_chain_engine import OptionChainEngine
+        from option_signal_bridge import OptionDiscoveryConfig, OptionSignalBridge
+        from option_ws_client import OptionWSClient
+        from paper_positions import PaperPositionManager
+        from rollover_engine import NSE_HOLIDAYS, should_rollover_v1_now, should_rollover_v2_now, rollover_info
+        from signal_engine import SignalEngine
+        from state_manager import StateManager
+        from supertrend_engine import SupertrendEngine
+        from datetime import timezone, timedelta
+        from typing import Optional as Opt
+
+        _IST = timezone(timedelta(hours=5, minutes=30))
+
+        def ist_now():
+            return datetime.now(tz=_IST)
+
+        self.post_event("Authenticating Dhan token...")
+        try:
+            client_id, access_token = ensure_dhan_token()
+            self.post_event(f"Token OK | client={client_id}")
+        except Exception as e:
+            self.post_event(f"Token failed: {e}")
+            self._running = False
+            return
+
+        tf   = int(kwargs.get("timeframe", 60))
+        var  = int(kwargs.get("variant", 3))
+        stp  = int(kwargs.get("st_period", 10))
+        stm  = float(kwargs.get("st_multiplier", 3.0))
+        slp  = float(kwargs.get("sl_percent", 30.0))
+        seg  = "IDX_I"
+        sid  = "13"    # NIFTY
+
+        state_manager   = StateManager("state/runtime_state.json", tf, stp, stm)
+        candle_builder  = TimeframeCandleBuilder(tf)
+        st_engine       = SupertrendEngine(stp, stm)
+        signal_engine   = SignalEngine(var, slp, state_manager)
+
+        oce = OptionChainEngine(
+            client_id=client_id, access_token=access_token,
+            underlying_scrip=13, underlying_seg=seg,
+            atm_step=100, strike_step=50,
+        )
+        bridge_obj = OptionSignalBridge(
+            option_chain_engine=oce,
+            discovery_cfg=OptionDiscoveryConfig(
+                strike_step=50,
+                otm_steps=tuple(int(x) for x in str(kwargs.get("otm_steps","3,4,5,6")).split(",")),
+                expiry_mode=str(kwargs.get("expiry_mode","AUTO")),
+                min_short_premium=float(kwargs.get("min_short_premium",200)),
+                max_short_premium=float(kwargs.get("max_short_premium",300)),
+                min_hedge_premium=float(kwargs.get("min_hedge_premium",50)),
+                max_hedge_premium=float(kwargs.get("max_hedge_premium",90)),
+                min_net_credit=float(kwargs.get("min_net_credit",150)),
+            ),
+        )
+        paper_mgr = PaperPositionManager()
+
+        option_ws = OptionWSClient(
+            client_id=client_id, access_token=access_token,
+            on_tick=lambda sid_, ltp_, ltt_: _on_opt_tick(sid_, ltp_, ltt_),
+            on_status=lambda m: self.post_event(f"OptionWS: {m}"),
+        )
+
+        v1_exit_today    = False
+        _930_done        = None
+        _rollover_done   = None
+        last_flip        = None
+        last_active      = None
+        boot_done        = False
+        last_disc_epoch  = None
+
+        def _sync_ws():
+            option_ws.set_instruments(paper_mgr.active_option_watchlist())
+
+        def _on_opt_tick(security_id, ltp, ltt):
+            nonlocal v1_exit_today
+            sl_ev = paper_mgr.update_live_quote(security_id, ltp, ltt)
+            if sl_ev:
+                self.post_event(sl_ev)
+                if var in (1, 4) and paper_mgr.has_active():
+                    pos = paper_mgr.snapshot().get("active_position") or {}
+                    if pos.get("short_sl_hit"):
+                        msg = paper_mgr.close_active_position(
+                            f"Variant {var}: SL breached on live tick"
+                        )
+                        self.post_event(msg)
+                        _sync_ws()
+                        if var == 1:
+                            v1_exit_today = True
+            _push_snapshot()
+
+        def _push_snapshot():
+            snap = candle_builder.snapshot()
+            self.update_snapshot({
+                "ltp": snap.get("last_ltp"),
+                "ltt_epoch": snap.get("last_ltt_epoch"),
+                "current_candle": snap.get("current"),
+                "recent_closed": snap.get("history", [])[:8],
+                "st": st_engine.snapshot(),
+                "signal": signal_engine.snapshot(),
+                "option": bridge_obj.snapshot(),
+                "paper": paper_mgr.snapshot(),
+            })
+
+        def _candle_epoch(c):
+            for k in ("bucket","epoch","start_epoch","ts","timestamp","time"):
+                if c.get(k) is not None:
+                    return int(c[k])
+            return None
+
+        def _actionable_trend():
+            s = signal_engine.snapshot()
+            if s.get("active") == "SHORT_PUT": return "BUY"
+            if s.get("active") == "SHORT_CALL": return "SELL"
+            t = str(s.get("trend") or "").upper()
+            if t in ("BUY","SELL") and s.get("signal_candle_high") is not None:
+                return t
+            return None
+
+        def _discover(*, spot, trend, prefix, epoch=None):
+            nonlocal last_disc_epoch
+            setup, reason = bridge_obj.discover_setup(spot_price=spot, trend=trend)
+            self.post_event(f"{prefix} | {reason}")
+            if setup is not None:
+                msg = paper_mgr.open_position(setup, spot_price=spot, sl_percent=slp)
+                self.post_event(msg)
+                _sync_ws()
+            if epoch is not None:
+                last_disc_epoch = int(epoch)
+            _push_snapshot()
+
+        def _after_1015():
+            n = ist_now()
+            return n.hour > 10 or (n.hour == 10 and n.minute >= 15)
+
+        # ── bootstrap ─────────────────────────────────────────────────────
+        self.post_event("Loading history...")
+        candles_1m, hmsg = fetch_intraday_1m_history(
+            client_id=client_id, access_token=access_token,
+            security_id=sid, exchange_segment=seg,
+            lookback_days=5, limit=1500, instrument="INDEX",
+        )
+        self.post_event(hmsg)
+        if candles_1m:
+            n_tf = candle_builder.seed_from_1m_history(candles_1m)
+            self.post_event(f"Seeded {n_tf} candles")
+            for c in reversed(list(candle_builder.snapshot().get("history",[]))):
+                r = st_engine.update(c)
+                signal_engine.process_historical_candle(c, r)
+            state_manager.mark_indicator_seeded()
+            self.post_event("Warmup complete")
+
+        self.post_event("Fetching expiry list...")
+        try:
+            emsg = bridge_obj.refresh_master()
+            self.post_event(emsg)
+        except Exception as e:
+            self.post_event(f"Expiry bootstrap failed: {e}")
+
+        expiry_list = bridge_obj.last_expiry_info.get("all") or []
+        if expiry_list:
+            self.post_event(rollover_info(expiry_list))
+
+        _push_snapshot()
+
+        # ── tick handler ──────────────────────────────────────────────────
+        def on_tick(price, ltt_epoch):
+            nonlocal v1_exit_today, _930_done, _rollover_done, last_flip, last_active, boot_done
+
+            if self._stop_event.is_set():
+                return
+
+            closed = candle_builder.on_tick(price, ltt_epoch)
+            _push_snapshot()
+
+            today = ist_now().date()
+            n = ist_now()
+
+            # 9:30 AM Variant 1 check
+            if var == 1 and n.hour == 9 and n.minute == 30 and _930_done != today:
+                _930_done = today
+                v1_exit_today = False
+                if paper_mgr.has_active():
+                    pos = paper_mgr.snapshot().get("active_position") or {}
+                    if pos.get("short_sl_hit"):
+                        msg = paper_mgr.close_active_position("V1: 9:30 gap-up SL check")
+                        self.post_event(msg)
+                        _sync_ws()
+                        v1_exit_today = True
+
+            # 3 PM rollover check
+            if n.hour == 15 and _rollover_done != today:
+                rv = int(kwargs.get("rollover_variant", 2))
+                el = bridge_obj.last_expiry_info.get("all") or []
+                triggered = False
+                if rv == 1 and el:
+                    triggered = should_rollover_v1_now(el)
+                elif rv == 2 and el:
+                    triggered = should_rollover_v2_now(el, NSE_HOLIDAYS)
+                if triggered:
+                    _rollover_done = today
+                    self.post_event(f"Rollover V{rv} triggered @ 3 PM IST")
+                    if paper_mgr.has_active():
+                        msg = paper_mgr.close_active_position("Rollover close")
+                        self.post_event(msg)
+                        _sync_ws()
+                    trend = _actionable_trend()
+                    if trend and price:
+                        _discover(spot=float(price), trend=trend, prefix=f"Rollover V{rv} re-entry")
+
+            # bootstrap discovery
+            if not boot_done:
+                trend = _actionable_trend()
+                if trend and not paper_mgr.has_active():
+                    _discover(spot=float(price), trend=trend, prefix="Bootstrap")
+                    last_active = signal_engine.snapshot().get("active")
+                boot_done = True
+
+            for candle in closed:
+                r = st_engine.update(candle)
+                events = signal_engine.process_live_closed_candle(candle, r)
+                for ev in events:
+                    self.post_event(ev)
+
+                # sync paper close
+                sig = signal_engine.snapshot()
+                cur_active = sig.get("active")
+                if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
+                    if paper_mgr.has_active():
+                        reason = sig.get("last_event") or "Signal exit"
+                        msg = paper_mgr.close_active_position(reason)
+                        self.post_event(msg)
+                        _sync_ws()
+                        if var == 1:
+                            v1_exit_today = True
+                last_active = cur_active
+
+                cc = float(candle["close"])
+                ep = _candle_epoch(candle)
+
+                # flip discovery
+                flip = sig.get("signal")
+                if flip in ("BUY","SELL") and flip != last_flip:
+                    if not (var == 1 and v1_exit_today and not _after_1015()):
+                        _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
+                    last_flip = flip
+                elif flip in (None,"","-"):
+                    last_flip = None
+
+                # flat rescan
+                if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
+                    if not (var == 1 and v1_exit_today and not _after_1015()):
+                        trend = _actionable_trend()
+                        if trend and last_disc_epoch != ep:
+                            _discover(spot=cc, trend=trend, prefix="Flat rescan", epoch=ep)
+
+                _push_snapshot()
+
+        def on_status(msg):
+            self.post_event(msg)
+
+        ws = DhanWSClient(
+            client_id=client_id, access_token=access_token,
+            exchange_segment=seg, security_id=sid,
+            on_tick=on_tick, on_status=on_status,
+        )
+
+        option_ws.start()
+        ws.start()
+        self.post_event("WebSocket started — strategy live")
+
+        while not self._stop_event.is_set():
+            time.sleep(0.2)
+
+        ws.stop()
+        option_ws.stop()
+        self.post_event("Strategy stopped")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _card(parent, **kw) -> ctk.CTkFrame:
+    return ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=10, **kw)
+
+
+def _label(parent, text, font=FONT_SM, color=WHITE, **kw) -> ctk.CTkLabel:
+    return ctk.CTkLabel(parent, text=text, font=font, text_color=color, **kw)
+
+
+def _entry(parent, placeholder="", show=None, width=260) -> ctk.CTkEntry:
+    kw = dict(
+        placeholder_text=placeholder,
+        fg_color=PANEL_BG, border_color=BORDER,
+        text_color=WHITE, placeholder_text_color=MUTED,
+        width=width,
+    )
+    if show:
+        kw["show"] = show
+    return ctk.CTkEntry(parent, **kw)
+
+
+def _fmt(x, digits=2):
+    if x is None: return "-"
+    try: return f"{float(x):.{digits}f}"
+    except: return "-"
+
+
+def _fmt_epoch(e):
+    if e is None: return "--:--"
+    try: return datetime.fromtimestamp(int(e)).strftime("%H:%M")
+    except: return "--:--"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab 1 — Token Manager
+# ─────────────────────────────────────────────────────────────────────────────
+class TokenTab(ctk.CTkFrame):
+    def __init__(self, parent, on_token_saved=None):
+        super().__init__(parent, fg_color="transparent")
+        self._on_token_saved = on_token_saved
+        self._build()
+
+    def _build(self):
+        wrap = _card(self)
+        wrap.pack(fill="both", expand=True, padx=24, pady=24)
+
+        _label(wrap, "Dhan API Credentials", font=FONT_LG).pack(pady=(18, 4))
+        _label(wrap, "Enter your credentials. Token is generated automatically via TOTP.",
+               color=MUTED).pack(pady=(0, 16))
+
+        grid = ctk.CTkFrame(wrap, fg_color="transparent")
+        grid.pack(fill="x", padx=32)
+        grid.columnconfigure(1, weight=1)
+
+        fields = [
+            ("Client ID",    "10-digit Dhan Client ID",    False),
+            ("PIN",          "4-digit trading PIN",        True),
+            ("TOTP Secret",  "TOTP secret from web.dhan.co",True),
+        ]
+
+        self._entries: dict[str, ctk.CTkEntry] = {}
+        for i, (label, ph, hide) in enumerate(fields):
+            _label(grid, label, color=MUTED).grid(row=i, column=0, sticky="w", pady=8, padx=(0,16))
+            e = _entry(grid, placeholder=ph, show="•" if hide else None, width=320)
+            e.grid(row=i, column=1, sticky="ew", pady=8)
+            self._entries[label] = e
+
+        self._status = _label(wrap, "", color=MUTED)
+        self._status.pack(pady=(16, 4))
+
+        self._token_box = ctk.CTkTextbox(
+            wrap, height=60, fg_color=PANEL_BG, border_color=BORDER,
+            text_color=GREEN, font=FONT_MONO, wrap="word",
+        )
+        self._token_box.pack(fill="x", padx=32, pady=(4, 16))
+        self._token_box.insert("0.0", "Token will appear here after generation...")
+        self._token_box.configure(state="disabled")
+
+        btn_row = ctk.CTkFrame(wrap, fg_color="transparent")
+        btn_row.pack(pady=(0, 20))
+
+        ctk.CTkButton(
+            btn_row, text="  Generate Token", command=self._generate,
+            fg_color=ACCENT2, hover_color="#3451d1", width=180,
+        ).pack(side="left", padx=8)
+
+        ctk.CTkButton(
+            btn_row, text="  Load from .env", command=self._load_env,
+            fg_color=PANEL_BG, hover_color=BORDER, border_color=BORDER,
+            border_width=1, width=160,
+        ).pack(side="left", padx=8)
+
+        ctk.CTkButton(
+            btn_row, text="  Clear", command=self._clear,
+            fg_color=PANEL_BG, hover_color=BORDER, border_color=BORDER,
+            border_width=1, width=100,
+        ).pack(side="left", padx=8)
+
+    def _generate(self):
+        client_id   = self._entries["Client ID"].get().strip()
+        pin         = self._entries["PIN"].get().strip()
+        totp_secret = self._entries["TOTP Secret"].get().strip()
+
+        if not all([client_id, pin, totp_secret]):
+            self._status.configure(text="⚠ Please fill all fields", text_color=YELLOW)
+            return
+
+        self._status.configure(text="Generating token...", text_color=MUTED)
+        self.update()
+
+        def _run():
+            try:
+                from dhan_token_manager import generate_token_via_totp, save_token_to_env
+                result = generate_token_via_totp(client_id, pin, totp_secret)
+                if result.get("success"):
+                    token = result["access_token"]
+                    save_token_to_env(token, result.get("expiry", ""))
+                    os.environ["DHAN_ACCESS_TOKEN"] = token
+                    self._show_token(token, f"✅ Token generated | Expires: {result.get('expiry','')[:19]}")
+                    if self._on_token_saved:
+                        self._on_token_saved(client_id, token)
+                else:
+                    self._status.configure(text=f"❌ {result.get('error','Failed')}", text_color=RED)
+            except Exception as e:
+                self._status.configure(text=f"❌ {e}", text_color=RED)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _load_env(self):
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(".env"))
+            cid   = os.getenv("DHAN_CLIENT_ID","")
+            tok   = os.getenv("DHAN_ACCESS_TOKEN","")
+            pin   = os.getenv("DHAN_PIN","")
+            totp  = os.getenv("DHAN_TOTP_SECRET","")
+            if cid:
+                self._entries["Client ID"].delete(0,"end"); self._entries["Client ID"].insert(0, cid)
+            if pin:
+                self._entries["PIN"].delete(0,"end"); self._entries["PIN"].insert(0, pin)
+            if totp:
+                self._entries["TOTP Secret"].delete(0,"end"); self._entries["TOTP Secret"].insert(0, totp)
+            if tok:
+                self._show_token(tok, "✅ Loaded from .env")
+                if self._on_token_saved:
+                    self._on_token_saved(cid, tok)
+            else:
+                self._status.configure(text="Credentials loaded. No token found — generate one.", text_color=YELLOW)
+        except Exception as e:
+            self._status.configure(text=f"❌ {e}", text_color=RED)
+
+    def _clear(self):
+        for e in self._entries.values():
+            e.delete(0, "end")
+        self._token_box.configure(state="normal")
+        self._token_box.delete("0.0", "end")
+        self._token_box.insert("0.0", "Token will appear here after generation...")
+        self._token_box.configure(state="disabled")
+        self._status.configure(text="", text_color=MUTED)
+
+    def _show_token(self, token: str, msg: str):
+        self._token_box.configure(state="normal")
+        self._token_box.delete("0.0", "end")
+        self._token_box.insert("0.0", token)
+        self._token_box.configure(state="disabled")
+        self._status.configure(text=msg, text_color=GREEN)
+
+    def get_credentials(self) -> dict:
+        return {
+            "client_id":   self._entries["Client ID"].get().strip(),
+            "pin":         self._entries["PIN"].get().strip(),
+            "totp_secret": self._entries["TOTP Secret"].get().strip(),
+            "access_token": os.environ.get("DHAN_ACCESS_TOKEN",""),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab 2 — Strategy Setup
+# ─────────────────────────────────────────────────────────────────────────────
+class SetupTab(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent, fg_color="transparent")
+        self._build()
+
+    def _build(self):
+        canvas = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        canvas.pack(fill="both", expand=True, padx=8, pady=8)
+
+        _label(canvas, "Strategy Configuration", font=FONT_LG).pack(pady=(12,2))
+        _label(canvas, "All parameters. Changes take effect on next Start.", color=MUTED).pack(pady=(0,16))
+
+        # ── two column layout ──────────────────────────────────────────────
+        cols = ctk.CTkFrame(canvas, fg_color="transparent")
+        cols.pack(fill="x", padx=16)
+        cols.columnconfigure((0,1), weight=1, uniform="col")
+
+        left  = _card(cols); left.grid(row=0, column=0, sticky="nsew", padx=(0,8), pady=4)
+        right = _card(cols); right.grid(row=0, column=1, sticky="nsew", padx=(8,0), pady=4)
+
+        # ── LEFT: core signal params ───────────────────────────────────────
+        _label(left, "Signal & Indicator", font=FONT_MD).pack(pady=(14,8))
+
+        self.var_timeframe    = self._combo(left, "Timeframe (minutes)",
+                                            ["1","5","60","120"], default="60")
+        self.var_variant      = self._combo(left, "Strategy Variant",
+                                            ["1 — SL% + ST change",
+                                             "2 — ST change only",
+                                             "3 — Candle breach + ST change",
+                                             "4 — Candle breach + SL%"],
+                                            default="3 — Candle breach + ST change")
+        self.var_st_period    = self._combo(left, "ST Period", ["8","10"], default="10")
+        self.var_st_mult      = self._combo(left, "ST Multiplier", ["3.0","3.5","4.0"], default="3.0")
+        self.var_sl_pct       = self._slider(left, "SL % on Short Premium",
+                                             from_=25, to=40, default=30)
+
+        # ── RIGHT: option discovery params ────────────────────────────────
+        _label(right, "Option Discovery", font=FONT_MD).pack(pady=(14,8))
+
+        self.var_expiry_mode  = self._combo(right, "Expiry Mode",
+                                            ["AUTO","TRADING_DAY","CURRENT","NEXT","FAR"],
+                                            default="AUTO")
+        self.var_otm_steps    = self._combo(right, "OTM Steps to Try",
+                                            ["3,4,5,6","3,4","4,5,6","3","4","5"],
+                                            default="3,4,5,6")
+        self.var_rollover     = self._combo(right, "Rollover Variant",
+                                            ["1 — 3rd weekly expiry @ 3 PM",
+                                             "2 — 4 trading days before expiry"],
+                                            default="2 — 4 trading days before expiry")
+
+        _label(right, "Premium Rules  (₹)", font=FONT_MD, color=MUTED).pack(pady=(16,4))
+
+        self.var_min_short    = self._slider(right, "Min Short Premium", 100, 300, 200)
+        self.var_max_short    = self._slider(right, "Max Short Premium", 200, 500, 300)
+        self.var_min_hedge    = self._slider(right, "Min Hedge Premium",  20, 100,  50)
+        self.var_max_hedge    = self._slider(right, "Max Hedge Premium",  50, 200,  90)
+        self.var_min_credit   = self._slider(right, "Min Net Credit",     50, 300, 150)
+
+    # ── helpers ────────────────────────────────────────────────────────────
+    def _combo(self, parent, label, values, default=None) -> ctk.CTkComboBox:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=4)
+        row.columnconfigure(1, weight=1)
+        _label(row, label, color=MUTED).grid(row=0, column=0, sticky="w")
+        cb = ctk.CTkComboBox(
+            row, values=values, width=220,
+            fg_color=PANEL_BG, border_color=BORDER,
+            button_color=ACCENT2, button_hover_color="#3451d1",
+            text_color=WHITE, dropdown_fg_color=PANEL_BG,
+        )
+        cb.set(default or values[0])
+        cb.grid(row=0, column=1, sticky="e", pady=2)
+        return cb
+
+    def _slider(self, parent, label, from_, to, default) -> ctk.CTkSlider:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=4)
+        lbl = _label(row, f"{label}: {default}", color=MUTED)
+        lbl.pack(anchor="w")
+        sl = ctk.CTkSlider(
+            row, from_=from_, to=to, number_of_steps=int(to-from_),
+            fg_color=BORDER, progress_color=ACCENT2, button_color=WHITE,
+            button_hover_color=ACCENT2,
+        )
+        sl.set(default)
+        sl.pack(fill="x")
+
+        def _upd(v):
+            lbl.configure(text=f"{label}: {int(v)}")
+        sl.configure(command=_upd)
+        return sl
+
+    def get_config(self) -> dict:
+        def _variant_num(s):
+            return int(str(s).split(" ")[0])
+        def _rollover_num(s):
+            return int(str(s).split(" ")[0])
+
+        return {
+            "timeframe":        int(self.var_timeframe.get()),
+            "variant":          _variant_num(self.var_variant.get()),
+            "st_period":        int(self.var_st_period.get()),
+            "st_multiplier":    float(self.var_st_mult.get()),
+            "sl_percent":       float(self.var_sl_pct.get()),
+            "expiry_mode":      self.var_expiry_mode.get(),
+            "otm_steps":        self.var_otm_steps.get(),
+            "rollover_variant": _rollover_num(self.var_rollover.get()),
+            "min_short_premium": float(self.var_min_short.get()),
+            "max_short_premium": float(self.var_max_short.get()),
+            "min_hedge_premium": float(self.var_min_hedge.get()),
+            "max_hedge_premium": float(self.var_max_hedge.get()),
+            "min_net_credit":   float(self.var_min_credit.get()),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab 3 — Live Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+class DashboardTab(ctk.CTkFrame):
+    def __init__(self, parent, bridge: StrategyBridge):
+        super().__init__(parent, fg_color="transparent")
+        self._bridge = bridge
+        self._build()
+        self._refresh()
+
+    def _build(self):
+        # ── top row: status cards ─────────────────────────────────────────
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(8,4))
+        for i in range(6):
+            top.columnconfigure(i, weight=1)
+
+        def stat_card(col, title):
+            f = _card(top)
+            f.grid(row=0, column=col, sticky="ew", padx=4)
+            _label(f, title, color=MUTED, font=("Segoe UI",9)).pack(pady=(6,0))
+            v = _label(f, "-", font=("Segoe UI",14,"bold"))
+            v.pack(pady=(0,6))
+            return v
+
+        self._lbl_ltp     = stat_card(0, "NIFTY LTP")
+        self._lbl_trend   = stat_card(1, "ST Trend")
+        self._lbl_signal  = stat_card(2, "Flip Signal")
+        self._lbl_active  = stat_card(3, "Active Position")
+        self._lbl_pnl_pts = stat_card(4, "P&L (pts)")
+        self._lbl_pnl_rs  = stat_card(5, "P&L (₹)")
+
+        # ── middle: candles + option setup side by side ───────────────────
+        mid = ctk.CTkFrame(self, fg_color="transparent")
+        mid.pack(fill="both", expand=True, padx=12, pady=4)
+        mid.columnconfigure(0, weight=2)
+        mid.columnconfigure(1, weight=3)
+
+        # candle table
+        ccard = _card(mid)
+        ccard.grid(row=0, column=0, sticky="nsew", padx=(0,6))
+        _label(ccard, "Recent Candles", font=FONT_MD).pack(pady=(10,4))
+
+        self._candle_box = ctk.CTkTextbox(
+            ccard, fg_color=PANEL_BG, text_color=WHITE, font=FONT_MONO,
+            border_color=BORDER, wrap="none",
+        )
+        self._candle_box.pack(fill="both", expand=True, padx=8, pady=(0,8))
+
+        # option + paper block
+        ocard = _card(mid)
+        ocard.grid(row=0, column=1, sticky="nsew", padx=(6,0))
+        _label(ocard, "Option Setup & Paper Position", font=FONT_MD).pack(pady=(10,4))
+
+        self._option_box = ctk.CTkTextbox(
+            ocard, fg_color=PANEL_BG, text_color=WHITE, font=FONT_MONO,
+            border_color=BORDER, wrap="word",
+        )
+        self._option_box.pack(fill="both", expand=True, padx=8, pady=(0,8))
+
+        # ── bottom: event log ─────────────────────────────────────────────
+        ecard = _card(self)
+        ecard.pack(fill="x", padx=12, pady=(0,8))
+        _label(ecard, "Strategy Events", font=FONT_MD).pack(pady=(8,4), anchor="w", padx=12)
+
+        self._event_box = ctk.CTkTextbox(
+            ecard, height=160, fg_color=PANEL_BG, text_color=MUTED,
+            font=FONT_MONO, border_color=BORDER, wrap="word",
+        )
+        self._event_box.pack(fill="x", padx=8, pady=(0,8))
+
+    def _refresh(self):
+        if not self.winfo_exists():
+            return
+        try:
+            self._update_ui()
+        except Exception:
+            pass
+        self.after(1000, self._refresh)
+
+    def _update_ui(self):
+        snap    = self._bridge.get_snapshot()
+        events  = self._bridge.get_events()
+
+        st  = snap.get("st") or {}
+        sig = snap.get("signal") or {}
+        opt = snap.get("option") or {}
+        pap = snap.get("paper") or {}
+        pos = pap.get("active_position") or {}
+
+        ltp    = snap.get("ltp")
+        trend  = st.get("trend") or sig.get("trend") or "-"
+        signal = sig.get("signal") or "-"
+        active = sig.get("active") or "-"
+
+        # top cards
+        self._lbl_ltp.configure(text=_fmt(ltp), text_color=WHITE)
+        self._lbl_trend.configure(
+            text=trend,
+            text_color=GREEN if trend == "BUY" else (RED if trend == "SELL" else MUTED)
+        )
+        self._lbl_signal.configure(
+            text=signal,
+            text_color=GREEN if signal == "BUY" else (RED if signal == "SELL" else MUTED)
+        )
+        self._lbl_active.configure(
+            text=active,
+            text_color=YELLOW if active not in ("-", None) else MUTED
+        )
+
+        pnl_pts = pos.get("pnl_points")
+        pnl_rs  = pos.get("pnl_rupees")
+        if pnl_pts is not None:
+            c = GREEN if float(pnl_pts) >= 0 else RED
+            self._lbl_pnl_pts.configure(text=f"{float(pnl_pts):+.2f}", text_color=c)
+            self._lbl_pnl_rs.configure(text=f"₹{float(pnl_rs or 0):+.0f}", text_color=c)
+        else:
+            self._lbl_pnl_pts.configure(text="-", text_color=MUTED)
+            self._lbl_pnl_rs.configure(text="-", text_color=MUTED)
+
+        # candle table
+        self._candle_box.configure(state="normal")
+        self._candle_box.delete("0.0", "end")
+        hdr = f"{'Time':>6}  {'Open':>10}  {'High':>10}  {'Low':>10}  {'Close':>10}  {'Ticks':>5}\n"
+        self._candle_box.insert("end", hdr)
+        self._candle_box.insert("end", "─" * 60 + "\n")
+        for c in (snap.get("recent_closed") or [])[:8]:
+            t = _fmt_epoch(c.get("bucket", c.get("epoch", c.get("time"))))
+            self._candle_box.insert(
+                "end",
+                f"{t:>6}  {_fmt(c.get('open')):>10}  {_fmt(c.get('high')):>10}  "
+                f"{_fmt(c.get('low')):>10}  {_fmt(c.get('close')):>10}  "
+                f"{str(c.get('ticks','-')):>5}\n"
+            )
+        self._candle_box.configure(state="disabled")
+
+        # option + paper block
+        self._option_box.configure(state="normal")
+        self._option_box.delete("0.0", "end")
+
+        def line(s): self._option_box.insert("end", s + "\n")
+
+        exp_cur = opt.get("expiry_current") or "-"
+        exp_nxt = opt.get("expiry_next")    or "-"
+        exp_far = opt.get("expiry_far")     or "-"
+        line(f"Expiries  | current={exp_cur} | next={exp_nxt} | far={exp_far}")
+        line("─" * 54)
+
+        if opt.get("has_setup"):
+            line(f"Setup     | trend={opt.get('trend')} | expiry={opt.get('expiry_text')}")
+            line(f"OTM       | step={opt.get('otm_step')} | hedge_steps={opt.get('hedge_distance_steps')}")
+            line(f"Short Leg | {opt.get('short_symbol')} @ {_fmt(opt.get('short_premium'))}")
+            line(f"Hedge Leg | {opt.get('hedge_symbol')} @ {_fmt(opt.get('hedge_premium'))}")
+            line(f"Net Credit| {_fmt(opt.get('net_credit'))}")
+        else:
+            line("Setup     | No valid setup yet")
+
+        line("─" * 54)
+        if pap.get("has_active_position"):
+            sl_hit = "  ⚠ SL HIT" if pos.get("short_sl_hit") else ""
+            line(f"Position  | OPEN | trend={pos.get('trend')} | entry={pos.get('entry_time')}{sl_hit}")
+            line(f"Entry     | short @ {_fmt(pos.get('short_entry_premium'))} | hedge @ {_fmt(pos.get('hedge_entry_premium'))} | net={_fmt(pos.get('net_credit_entry'))}")
+            line(f"Live MTM  | short={_fmt(pos.get('short_ltp'))} | hedge={_fmt(pos.get('hedge_ltp'))} | net_now={_fmt(pos.get('net_premium_now'))}")
+            line(f"P&L       | pts={_fmt(pnl_pts)} | ₹={_fmt(pnl_rs,0)} | SL price={_fmt(pos.get('short_sl_price'))}")
+            line(f"Extremes  | max_profit={_fmt(pos.get('max_profit_seen'))} | max_loss={_fmt(pos.get('max_loss_seen'))}")
+        else:
+            line("Position  | No active paper position")
+
+        if pap.get("last_event"):
+            line(f"\nLast event: {pap.get('last_event')}")
+
+        self._option_box.configure(state="disabled")
+
+        # event log
+        self._event_box.configure(state="normal")
+        self._event_box.delete("0.0", "end")
+        for ev in (events or [])[:30]:
+            self._event_box.insert("end", ev + "\n")
+        self._event_box.configure(state="disabled")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Application Window
+# ─────────────────────────────────────────────────────────────────────────────
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self._bridge = StrategyBridge()
+        self.title("Balfund — Supertrend Option Seller")
+        self.geometry("1280x840")
+        self.minsize(1100, 700)
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        self.configure(fg_color=DARK_BG)
+        self._build()
+
+    def _build(self):
+        # ── header ────────────────────────────────────────────────────────
+        header = ctk.CTkFrame(self, fg_color=PANEL_BG, height=52, corner_radius=0)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+
+        _label(header, "  BALFUND", font=("Segoe UI", 16, "bold"), color=ACCENT).pack(side="left", padx=8)
+        _label(header, "Supertrend Option Selling Strategy", font=FONT_MD, color=MUTED).pack(side="left")
+
+        # status + start/stop
+        self._status_lbl = _label(header, "●  STOPPED", color=RED, font=FONT_MD)
+        self._status_lbl.pack(side="right", padx=12)
+
+        self._btn_stop = ctk.CTkButton(
+            header, text="■  Stop", command=self._stop,
+            fg_color="#7f1d1d", hover_color=RED, width=100, height=32,
+        )
+        self._btn_stop.pack(side="right", padx=4)
+        self._btn_stop.configure(state="disabled")
+
+        self._btn_start = ctk.CTkButton(
+            header, text="▶  Start", command=self._start,
+            fg_color="#14532d", hover_color=GREEN, width=100, height=32,
+        )
+        self._btn_start.pack(side="right", padx=4)
+
+        # ── tabs ──────────────────────────────────────────────────────────
+        tabs = ctk.CTkTabview(
+            self, fg_color=DARK_BG,
+            segmented_button_fg_color=PANEL_BG,
+            segmented_button_selected_color=ACCENT,
+            segmented_button_unselected_color=PANEL_BG,
+            segmented_button_selected_hover_color="#c0392b",
+            text_color=WHITE,
+        )
+        tabs.pack(fill="both", expand=True)
+
+        tabs.add("🔑  Token Manager")
+        tabs.add("⚙  Strategy Setup")
+        tabs.add("📈  Live Dashboard")
+
+        self._token_tab   = TokenTab(tabs.tab("🔑  Token Manager"), on_token_saved=self._on_token_saved)
+        self._token_tab.pack(fill="both", expand=True)
+
+        self._setup_tab   = SetupTab(tabs.tab("⚙  Strategy Setup"))
+        self._setup_tab.pack(fill="both", expand=True)
+
+        self._dash_tab    = DashboardTab(tabs.tab("📈  Live Dashboard"), self._bridge)
+        self._dash_tab.pack(fill="both", expand=True)
+
+        # auto-refresh status
+        self._check_status()
+
+    def _on_token_saved(self, client_id, token):
+        pass   # credentials flow into bridge at Start time
+
+    def _start(self):
+        creds  = self._token_tab.get_credentials()
+        if not creds["client_id"]:
+            from tkinter import messagebox
+            messagebox.showwarning("Missing Credentials",
+                "Please enter your Dhan credentials in the Token Manager tab first.")
+            return
+
+        cfg = self._setup_tab.get_config()
+        cfg.update(creds)
+
+        result = self._bridge.start(cfg)
+        if result == "OK":
+            self._btn_start.configure(state="disabled")
+            self._btn_stop.configure(state="normal")
+
+    def _stop(self):
+        self._bridge.stop()
+        self._btn_start.configure(state="normal")
+        self._btn_stop.configure(state="disabled")
+
+    def _check_status(self):
+        if self._bridge.running:
+            self._status_lbl.configure(text="●  RUNNING", text_color=GREEN)
+        else:
+            self._status_lbl.configure(text="●  STOPPED", text_color=RED)
+        self.after(1000, self._check_status)
+
+    def on_closing(self):
+        self._bridge.stop()
+        time.sleep(0.3)
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    app = App()
+    app.protocol("WM_DELETE_WINDOW", app.on_closing)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
