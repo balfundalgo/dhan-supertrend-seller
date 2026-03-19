@@ -23,6 +23,9 @@ class SignalEngine:
         self.current_st_value: Optional[float] = None
         self.current_atr: Optional[float] = None
 
+        # Variant 5: dual-TF engine (set externally by main.py after construction)
+        self.dual_tf_engine = None
+
     def _active_from_trend(self, trend: Optional[str]) -> Optional[str]:
         if trend == "BUY":
             return "SHORT_PUT"
@@ -238,6 +241,13 @@ class SignalEngine:
         return events
 
     def snapshot(self) -> Dict[str, Any]:
+        # Variant 5: delegate to dual_tf_engine snapshot
+        if self.variant == 5 and self.dual_tf_engine is not None:
+            snap = self.dual_tf_engine.snapshot()
+            snap["variant"] = 5
+            snap["sl_percent"] = self.sl_percent
+            return snap
+
         state = self.state_manager.snapshot()
         return {
             "variant": self.variant,
