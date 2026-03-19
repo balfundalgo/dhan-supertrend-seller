@@ -520,6 +520,34 @@ class TokenTab(ctk.CTkFrame):
             border_width=1, width=100,
         ).pack(side="left", padx=8)
 
+        # ── Shared token section (dhan-token-generator.exe) ────────────────
+        sep = ctk.CTkFrame(wrap, fg_color=BORDER, height=1)
+        sep.pack(fill="x", padx=32, pady=(8, 12))
+
+        _label(wrap, "🔗  dhan-token-generator  (shared token source)",
+               font=FONT_MD, color=MUTED).pack()
+
+        shared_row = ctk.CTkFrame(wrap, fg_color="transparent")
+        shared_row.pack(pady=(6, 4))
+
+        self._shared_status = _label(
+            shared_row, "Checking...", color=MUTED, font=FONT_SM
+        )
+        self._shared_status.pack(side="left", padx=(0, 16))
+
+        ctk.CTkButton(
+            shared_row, text="🔄  Load from Token Generator",
+            command=self._load_from_shared,
+            fg_color=PANEL_BG, hover_color=BORDER, border_color=BORDER,
+            border_width=1, width=220,
+        ).pack(side="left")
+
+        _label(wrap, "Path: C:\\balfund_shared\\dhan_token.json",
+               color=MUTED, font=("Segoe UI", 9)).pack(pady=(2, 16))
+
+        # auto-refresh shared token status every 3 seconds
+        self._refresh_shared_status()
+
     def _generate(self):
         client_id   = self._entries["Client ID"].get().strip()
         pin         = self._entries["PIN"].get().strip()
@@ -588,6 +616,58 @@ class TokenTab(ctk.CTkFrame):
         self._token_box.insert("0.0", token)
         self._token_box.configure(state="disabled")
         self._status.configure(text=msg, text_color=GREEN)
+
+    def _load_from_shared(self):
+        try:
+            from dhan_token_manager import read_shared_token, SHARED_TOKEN_FILE
+            shared = read_shared_token()
+            if not shared.get("access_token"):
+                self._status.configure(
+                    text=f"⚠ Shared file not found at {SHARED_TOKEN_FILE}", text_color=YELLOW
+                )
+                return
+            cid = shared["client_id"]
+            tok = shared["access_token"]
+            # Fill client ID field
+            self._entries["Client ID"].delete(0, "end")
+            self._entries["Client ID"].insert(0, cid)
+            # Show token
+            self._show_token(tok, "✅ Loaded from dhan-token-generator shared file")
+            os.environ["DHAN_ACCESS_TOKEN"] = tok
+            os.environ["DHAN_CLIENT_ID"] = cid
+            if self._on_token_saved:
+                self._on_token_saved(cid, tok)
+        except Exception as e:
+            self._status.configure(text=f"❌ {e}", text_color=RED)
+
+    def _refresh_shared_status(self):
+        try:
+            from dhan_token_manager import read_shared_token, SHARED_TOKEN_FILE
+            shared = read_shared_token()
+            if shared.get("access_token"):
+                cid = shared.get("client_id", "?")
+                self._shared_status.configure(
+                    text=f"✅  Token found  |  client={cid}",
+                    text_color=GREEN,
+                )
+            elif SHARED_TOKEN_FILE.exists():
+                self._shared_status.configure(
+                    text="⚠  File exists but token is empty or invalid",
+                    text_color=YELLOW,
+                )
+            else:
+                self._shared_status.configure(
+                    text="●  Not found — run dhan-token-generator.exe first",
+                    text_color=MUTED,
+                )
+        except Exception:
+            self._shared_status.configure(text="●  Unable to check", text_color=MUTED)
+
+        # schedule next refresh in 3 seconds if widget still exists
+        try:
+            self.after(3000, self._refresh_shared_status)
+        except Exception:
+            pass
 
     def get_credentials(self) -> dict:
         return {
@@ -995,11 +1075,26 @@ class App(ctk.CTk):
         pass   # credentials flow into bridge at Start time
 
     def _start(self):
-        creds  = self._token_tab.get_credentials()
+        creds = self._token_tab.get_credentials()
+
+        # If no client_id in GUI, try shared token file automatically
+        if not creds["client_id"]:
+            try:
+                from dhan_token_manager import read_shared_token
+                shared = read_shared_token()
+                if shared.get("client_id") and shared.get("access_token"):
+                    creds["client_id"]    = shared["client_id"]
+                    creds["access_token"] = shared["access_token"]
+            except Exception:
+                pass
+
         if not creds["client_id"]:
             from tkinter import messagebox
-            messagebox.showwarning("Missing Credentials",
-                "Please enter your Dhan credentials in the Token Manager tab first.")
+            messagebox.showwarning(
+                "Missing Credentials",
+                "Please enter your Dhan credentials in the Token Manager tab,\n"
+                "or run dhan-token-generator.exe first."
+            )
             return
 
         cfg = self._setup_tab.get_config()
