@@ -282,11 +282,23 @@ class StrategyBridge:
             self.post_event("Warmup complete")
 
         self.post_event("Fetching expiry list...")
-        try:
-            emsg = bridge_obj.refresh_master()
-            self.post_event(emsg)
-        except Exception as e:
-            self.post_event(f"Expiry bootstrap failed: {e}")
+        for attempt in range(1, 6):
+            try:
+                emsg = bridge_obj.refresh_master()
+                expiry_list = bridge_obj.last_expiry_info.get("all") or []
+                if expiry_list:
+                    self.post_event(emsg)
+                    break
+                else:
+                    wait = 2 ** attempt
+                    self.post_event(f"Expiry list empty, retry {attempt}/5 in {wait}s...")
+                    time.sleep(wait)
+            except Exception as e:
+                wait = 2 ** attempt
+                self.post_event(f"Expiry fetch error: {e} — retry {attempt}/5 in {wait}s...")
+                time.sleep(wait)
+        else:
+            self.post_event("⚠ Expiry list unavailable after 5 attempts — discovery will retry on each candle close")
 
         expiry_list = bridge_obj.last_expiry_info.get("all") or []
         if expiry_list:
@@ -613,15 +625,15 @@ class SetupTab(ctk.CTkFrame):
         _label(left, "Signal & Indicator", font=FONT_MD).pack(pady=(14,8))
 
         self.var_timeframe    = self._combo(left, "Timeframe (minutes)",
-                                            ["1","5","60","120"], default="60")
+                                            ["1","5","30","45","60","120"], default="60")
         self.var_variant      = self._combo(left, "Strategy Variant",
                                             ["1 — SL% + ST change",
                                              "2 — ST change only",
                                              "3 — Candle breach + ST change",
                                              "4 — Candle breach + SL%"],
                                             default="3 — Candle breach + ST change")
-        self.var_st_period    = self._combo(left, "ST Period", ["8","10"], default="10")
-        self.var_st_mult      = self._combo(left, "ST Multiplier", ["3.0","3.5","4.0"], default="3.0")
+        self.var_st_period    = self._entry_field(left, "ST Period (integer)", default="10")
+        self.var_st_mult      = self._entry_field(left, "ST Multiplier (float)", default="3.0")
         self.var_sl_pct       = self._slider(left, "SL % on Short Premium",
                                              from_=25, to=40, default=30)
 
@@ -641,13 +653,27 @@ class SetupTab(ctk.CTkFrame):
 
         _label(right, "Premium Rules  (₹)", font=FONT_MD, color=MUTED).pack(pady=(16,4))
 
-        self.var_min_short    = self._slider(right, "Min Short Premium", 100, 300, 200)
-        self.var_max_short    = self._slider(right, "Max Short Premium", 200, 500, 300)
-        self.var_min_hedge    = self._slider(right, "Min Hedge Premium",  20, 100,  50)
-        self.var_max_hedge    = self._slider(right, "Max Hedge Premium",  50, 200,  90)
-        self.var_min_credit   = self._slider(right, "Min Net Credit",     50, 300, 150)
+        self.var_min_short    = self._slider(right, "Min Short Premium", 100, 500, 200)
+        self.var_max_short    = self._slider(right, "Max Short Premium", 100, 500, 300)
+        self.var_min_hedge    = self._slider(right, "Min Hedge Premium", 100, 400, 100)
+        self.var_max_hedge    = self._slider(right, "Max Hedge Premium", 100, 400, 200)
+        self.var_min_credit   = self._slider(right, "Min Net Credit",    150, 400, 150)
 
     # ── helpers ────────────────────────────────────────────────────────────
+    def _entry_field(self, parent, label, default="") -> ctk.CTkEntry:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=4)
+        row.columnconfigure(1, weight=1)
+        _label(row, label, color=MUTED).grid(row=0, column=0, sticky="w")
+        e = ctk.CTkEntry(
+            row, width=100,
+            fg_color=PANEL_BG, border_color=BORDER,
+            text_color=WHITE, placeholder_text_color=MUTED,
+        )
+        e.insert(0, default)
+        e.grid(row=0, column=1, sticky="e", pady=2)
+        return e
+
     def _combo(self, parent, label, values, default=None) -> ctk.CTkComboBox:
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=4)
@@ -686,21 +712,33 @@ class SetupTab(ctk.CTkFrame):
             return int(str(s).split(" ")[0])
         def _rollover_num(s):
             return int(str(s).split(" ")[0])
+        def _safe_int(s, default):
+            try:
+                v = int(str(s).strip())
+                return v if v > 0 else default
+            except Exception:
+                return default
+        def _safe_float(s, default):
+            try:
+                v = float(str(s).strip())
+                return v if v > 0 else default
+            except Exception:
+                return default
 
         return {
-            "timeframe":        int(self.var_timeframe.get()),
-            "variant":          _variant_num(self.var_variant.get()),
-            "st_period":        int(self.var_st_period.get()),
-            "st_multiplier":    float(self.var_st_mult.get()),
-            "sl_percent":       float(self.var_sl_pct.get()),
-            "expiry_mode":      self.var_expiry_mode.get(),
-            "otm_steps":        self.var_otm_steps.get(),
-            "rollover_variant": _rollover_num(self.var_rollover.get()),
+            "timeframe":         int(self.var_timeframe.get()),
+            "variant":           _variant_num(self.var_variant.get()),
+            "st_period":         _safe_int(self.var_st_period.get(), 10),
+            "st_multiplier":     _safe_float(self.var_st_mult.get(), 3.0),
+            "sl_percent":        float(self.var_sl_pct.get()),
+            "expiry_mode":       self.var_expiry_mode.get(),
+            "otm_steps":         self.var_otm_steps.get(),
+            "rollover_variant":  _rollover_num(self.var_rollover.get()),
             "min_short_premium": float(self.var_min_short.get()),
             "max_short_premium": float(self.var_max_short.get()),
             "min_hedge_premium": float(self.var_min_hedge.get()),
             "max_hedge_premium": float(self.var_max_hedge.get()),
-            "min_net_credit":   float(self.var_min_credit.get()),
+            "min_net_credit":    float(self.var_min_credit.get()),
         }
 
 

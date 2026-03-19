@@ -42,10 +42,10 @@ class AppConfig:
     rollover_variant: int   # 1 = 3rd weekly expiry, 2 = 4 trading days before monthly
 
 
-def _prompt_timeframe(default_value: int = 1) -> int:
-    allowed = {1, 5, 60, 120}
+def _prompt_timeframe(default_value: int = 60) -> int:
+    allowed = {1, 5, 30, 45, 60, 120}
     while True:
-        raw = input("Select timeframe in minutes [1 / 5 / 60 / 120]: ").strip()
+        raw = input("Select timeframe in minutes [1 / 5 / 30 / 45 / 60 / 120]: ").strip()
         if not raw:
             return default_value
         try:
@@ -54,7 +54,7 @@ def _prompt_timeframe(default_value: int = 1) -> int:
                 return tf
         except Exception:
             pass
-        print("Invalid timeframe. Please enter 1, 5, 60, or 120.")
+        print("Invalid timeframe. Please enter 1, 5, 30, 45, 60, or 120.")
 
 
 def _prompt_variant(default_value: int = 1) -> int:
@@ -95,7 +95,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Dhan Supertrend Strategy Dashboard")
 
     # Existing Phase 2 args
-    parser.add_argument("--timeframe", type=int, choices=[1, 5, 60, 120], default=None)
+    parser.add_argument("--timeframe", type=int, choices=[1, 5, 30, 45, 60, 120], default=None)
     parser.add_argument("--variant", type=int, choices=[1, 2, 3, 4], default=None)
 
     parser.add_argument("--st-period", type=int, default=None)
