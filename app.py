@@ -117,6 +117,7 @@ class StrategyBridge:
         os.environ["OPTION_EXPIRY_MODE"]        = str(kwargs.get("expiry_mode", "AUTO"))
         os.environ["OPTION_OTM_STEPS"]          = str(kwargs.get("otm_steps", "3,4,5,6"))
         os.environ["ROLLOVER_VARIANT"]          = str(kwargs.get("rollover_variant", 2))
+        os.environ["LOWER_TF_MINUTES"]          = str(kwargs.get("lower_tf_minutes", 15))
         os.environ["MIN_SHORT_PREMIUM"]         = str(kwargs.get("min_short_premium", 200))
         os.environ["MAX_SHORT_PREMIUM"]         = str(kwargs.get("max_short_premium", 300))
         os.environ["MIN_HEDGE_PREMIUM"]         = str(kwargs.get("min_hedge_premium", 50))
@@ -158,6 +159,7 @@ class StrategyBridge:
         stp  = int(kwargs.get("st_period", 10))
         stm  = float(kwargs.get("st_multiplier", 3.0))
         slp  = float(kwargs.get("sl_percent", 30.0))
+        ltf  = int(kwargs.get("lower_tf_minutes", 15))
         seg  = "IDX_I"
         sid  = "13"    # NIFTY
 
@@ -165,6 +167,18 @@ class StrategyBridge:
         candle_builder  = TimeframeCandleBuilder(tf)
         st_engine       = SupertrendEngine(stp, stm)
         signal_engine   = SignalEngine(var, slp, state_manager)
+
+        # ── Variant 5: dual-TF setup ──────────────────────────────────────────
+        ltf_candle_builder = None
+        ltf_st_engine      = None
+        dual_tf_engine_obj = None
+
+        if var == 5:
+            from dual_tf_signal_engine import DualTFSignalEngine
+            ltf_candle_builder = TimeframeCandleBuilder(ltf)
+            ltf_st_engine      = SupertrendEngine(stp, stm)
+            dual_tf_engine_obj = DualTFSignalEngine(sl_percent=slp)
+            signal_engine.dual_tf_engine = dual_tf_engine_obj
 
         oce = OptionChainEngine(
             client_id=client_id, access_token=access_token,
@@ -279,6 +293,22 @@ class StrategyBridge:
                 r = st_engine.update(c)
                 signal_engine.process_historical_candle(c, r)
             state_manager.mark_indicator_seeded()
+
+            # Variant 5: seed LTF as well
+            if var == 5 and ltf_candle_builder is not None and dual_tf_engine_obj is not None:
+                n_ltf = ltf_candle_builder.seed_from_1m_history(candles_1m)
+                self.post_event(f"V5 LTF: seeded {n_ltf} x {ltf}m candles")
+                for c in reversed(list(ltf_candle_builder.snapshot().get("history", []))):
+                    r = ltf_st_engine.update(c)
+                    dual_tf_engine_obj.process_ltf_historical(c, r)
+                # HTF historical already done via signal_engine above — mark seeded
+                for c in reversed(list(candle_builder.snapshot().get("history", []))):
+                    r2 = st_engine.update(c)
+                    dual_tf_engine_obj.process_htf_historical(c, r2)
+                dual_tf_engine_obj.mark_htf_seeded()
+                dual_tf_engine_obj.mark_ltf_seeded()
+                self.post_event(f"V5 dual-TF warmup complete | HTF={tf}m LTF={ltf}m")
+
             self.post_event("Warmup complete")
 
         self.post_event("Fetching expiry list...")
@@ -314,6 +344,12 @@ class StrategyBridge:
                 return
 
             closed = candle_builder.on_tick(price, ltt_epoch)
+
+            # Variant 5: also route tick to LTF candle builder
+            ltf_closed = []
+            if var == 5 and ltf_candle_builder is not None:
+                ltf_closed = ltf_candle_builder.on_tick(price, ltt_epoch)
+
             _push_snapshot()
 
             today = ist_now().date()
@@ -359,45 +395,81 @@ class StrategyBridge:
                     last_active = signal_engine.snapshot().get("active")
                 boot_done = True
 
+            # ── HTF candles ───────────────────────────────────────────────────
             for candle in closed:
                 r = st_engine.update(candle)
-                events = signal_engine.process_live_closed_candle(candle, r)
-                for ev in events:
-                    self.post_event(ev)
 
-                # sync paper close
-                sig = signal_engine.snapshot()
-                cur_active = sig.get("active")
-                if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
-                    if paper_mgr.has_active():
-                        reason = sig.get("last_event") or "Signal exit"
-                        msg = paper_mgr.close_active_position(reason)
-                        self.post_event(msg)
-                        _sync_ws()
-                        if var == 1:
-                            v1_exit_today = True
-                last_active = cur_active
+                if var == 5 and dual_tf_engine_obj is not None:
+                    htf_evs = dual_tf_engine_obj.process_htf_live(candle, r)
+                    for ev in htf_evs:
+                        self.post_event(f"[HTF] {ev}")
+                    signal_engine.current_trend  = dual_tf_engine_obj.htf_trend
+                    signal_engine.current_flip_signal = dual_tf_engine_obj.htf_signal
+                    signal_engine.current_st_value = dual_tf_engine_obj.htf_st
+                    signal_engine.current_atr    = dual_tf_engine_obj.htf_atr
+                else:
+                    events = signal_engine.process_live_closed_candle(candle, r)
+                    for ev in events:
+                        self.post_event(ev)
 
-                cc = float(candle["close"])
-                ep = _candle_epoch(candle)
+                    # sync paper close (variants 1-4)
+                    sig = signal_engine.snapshot()
+                    cur_active = sig.get("active")
+                    if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
+                        if paper_mgr.has_active():
+                            reason = sig.get("last_event") or "Signal exit"
+                            msg = paper_mgr.close_active_position(reason)
+                            self.post_event(msg)
+                            _sync_ws()
+                            if var == 1:
+                                v1_exit_today = True
+                    last_active = cur_active
 
-                # flip discovery
-                flip = sig.get("signal")
-                if flip in ("BUY","SELL") and flip != last_flip:
-                    if not (var == 1 and v1_exit_today and not _after_1015()):
-                        _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
-                    last_flip = flip
-                elif flip in (None,"","-"):
-                    last_flip = None
+                    cc  = float(candle["close"])
+                    ep  = _candle_epoch(candle)
+                    flip = sig.get("signal")
+                    if flip in ("BUY","SELL") and flip != last_flip:
+                        if not (var == 1 and v1_exit_today and not _after_1015()):
+                            _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
+                        last_flip = flip
+                    elif flip in (None,"","-"):
+                        last_flip = None
 
-                # flat rescan
-                if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
-                    if not (var == 1 and v1_exit_today and not _after_1015()):
-                        trend = _actionable_trend()
-                        if trend and last_disc_epoch != ep:
-                            _discover(spot=cc, trend=trend, prefix="Flat rescan", epoch=ep)
+                    if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
+                        if not (var == 1 and v1_exit_today and not _after_1015()):
+                            trend = _actionable_trend()
+                            if trend and last_disc_epoch != ep:
+                                _discover(spot=cc, trend=trend, prefix="Flat rescan", epoch=ep)
 
                 _push_snapshot()
+
+            # ── LTF candles (Variant 5 only) ──────────────────────────────────
+            if var == 5 and dual_tf_engine_obj is not None:
+                for candle in ltf_closed:
+                    ltf_r = ltf_st_engine.update(candle)
+                    ltf_evs = dual_tf_engine_obj.process_ltf_live(candle, ltf_r)
+                    for ev in ltf_evs:
+                        self.post_event(f"[LTF] {ev}")
+
+                    sig = signal_engine.snapshot()
+                    cur_active = sig.get("active")
+                    if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
+                        if paper_mgr.has_active():
+                            reason = sig.get("last_event") or "LTF exit"
+                            msg = paper_mgr.close_active_position(reason)
+                            self.post_event(msg)
+                            _sync_ws()
+                    last_active = cur_active
+
+                    cc = float(candle["close"])
+                    ep = _candle_epoch(candle)
+
+                    if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
+                        trend = _actionable_trend()
+                        if trend and last_disc_epoch != ep:
+                            _discover(spot=cc, trend=trend, prefix="V5 LTF entry", epoch=ep)
+
+                    _push_snapshot()
 
         def on_status(msg):
             self.post_event(msg)
@@ -410,6 +482,10 @@ class StrategyBridge:
 
         option_ws.start()
         ws.start()
+        v5_info = f" | LTF={ltf}m" if var == 5 else ""
+        self.post_event(
+            f"Strategy started | variant={var}{v5_info} | HTF={tf}m | ST=({stp},{stm}) | SL={slp}%"
+        )
         self.post_event("WebSocket started — strategy live")
 
         while not self._stop_event.is_set():
@@ -710,12 +786,32 @@ class SetupTab(ctk.CTkFrame):
                                             ["1 — SL% + ST change",
                                              "2 — ST change only",
                                              "3 — Candle breach + ST change",
-                                             "4 — Candle breach + SL%"],
+                                             "4 — Candle breach + SL%",
+                                             "5 — Dual TF Trailing (HTF entry + LTF exit)"],
                                             default="3 — Candle breach + ST change")
         self.var_st_period    = self._entry_field(left, "ST Period (integer)", default="10")
         self.var_st_mult      = self._entry_field(left, "ST Multiplier (float)", default="3.0")
         self.var_sl_pct       = self._slider(left, "SL % on Short Premium",
                                              from_=25, to=40, default=30)
+
+        # Lower TF row — only meaningful for Variant 5
+        ltf_row = ctk.CTkFrame(left, fg_color="transparent")
+        ltf_row.pack(fill="x", padx=16, pady=4)
+        ltf_row.columnconfigure(1, weight=1)
+        _label(ltf_row, "Lower TF / mins  (Variant 5)", color=MUTED).grid(row=0, column=0, sticky="w")
+        self.var_lower_tf = ctk.CTkComboBox(
+            ltf_row,
+            values=["1","5","10","15","30","45","60","120"],
+            width=100,
+            fg_color=PANEL_BG, border_color=BORDER,
+            button_color=ACCENT2, button_hover_color="#3451d1",
+            text_color=WHITE, dropdown_fg_color=PANEL_BG,
+        )
+        self.var_lower_tf.set("15")
+        self.var_lower_tf.grid(row=0, column=1, sticky="e", pady=2)
+
+        _label(left, "↑ Higher TF (above) = HTF direction\nLower TF (above) = LTF entry/exit trigger",
+               color=MUTED, font=("Segoe UI", 9)).pack(padx=16, anchor="w")
 
         # ── RIGHT: option discovery params ────────────────────────────────
         _label(right, "Option Discovery", font=FONT_MD).pack(pady=(14,8))
@@ -814,6 +910,7 @@ class SetupTab(ctk.CTkFrame):
             "expiry_mode":       self.var_expiry_mode.get(),
             "otm_steps":         self.var_otm_steps.get(),
             "rollover_variant":  _rollover_num(self.var_rollover.get()),
+            "lower_tf_minutes":  int(self.var_lower_tf.get()),
             "min_short_premium": float(self.var_min_short.get()),
             "max_short_premium": float(self.var_max_short.get()),
             "min_hedge_premium": float(self.var_min_hedge.get()),
@@ -963,6 +1060,22 @@ class DashboardTab(ctk.CTkFrame):
         self._option_box.delete("0.0", "end")
 
         def line(s): self._option_box.insert("end", s + "\n")
+
+        # Variant 5: show dual-TF state at top
+        variant_num = sig.get("variant") or 0
+        if int(variant_num) == 5:
+            htf_trend  = sig.get("htf_trend")  or "-"
+            ltf_trend  = sig.get("ltf_trend")  or "-"
+            htf_st     = sig.get("htf_st")
+            ltf_st     = sig.get("ltf_st")
+            htf_armed  = sig.get("htf_armed",  False)
+            ltf_armed  = sig.get("ltf_armed",  False)
+            waiting    = sig.get("waiting_reentry", False)
+            line(f"Variant 5 — Dual TF Trailing")
+            line(f"HTF Trend = {htf_trend}  ST={_fmt(htf_st)}  Armed={'YES' if htf_armed else 'NO'}")
+            line(f"LTF Trend = {ltf_trend}  ST={_fmt(ltf_st)}  Armed={'YES' if ltf_armed else 'NO'}")
+            line(f"Active    = {sig.get('active') or '-'}  Waiting Re-entry={'YES' if waiting else 'NO'}")
+            line("─" * 54)
 
         exp_cur = opt.get("expiry_current") or "-"
         exp_nxt = opt.get("expiry_next")    or "-"

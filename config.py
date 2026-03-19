@@ -41,6 +41,9 @@ class AppConfig:
     # Rollover
     rollover_variant: int   # 1 = 3rd weekly expiry, 2 = 4 trading days before monthly
 
+    # Variant 5 dual-TF
+    lower_tf_minutes: int   # LTF for trailing exit (e.g. 15)
+
 
 def _prompt_timeframe(default_value: int = 60) -> int:
     allowed = {1, 5, 30, 45, 60, 120}
@@ -118,6 +121,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--rollover-variant", type=int, choices=[1, 2], default=None,
                         help="1=Roll on 3rd weekly expiry @ 3PM | 2=Roll 4 trading days before monthly @ 3PM")
+    parser.add_argument("--lower-tf", type=int,
+                        choices=[1, 5, 10, 15, 30, 45, 60, 120], default=None,
+                        help="Lower timeframe for Variant 5 dual-TF trailing (default: 15)")
 
     return parser
 
@@ -203,6 +209,14 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     if rollover_variant not in (1, 2):
         rollover_variant = 2
 
+    lower_tf_minutes = (
+        args.lower_tf
+        if hasattr(args, "lower_tf") and args.lower_tf is not None
+        else int(os.getenv("LOWER_TF_MINUTES", "15"))
+    )
+    if lower_tf_minutes not in (1, 5, 10, 15, 30, 45, 60, 120):
+        lower_tf_minutes = 15
+
     state_dir = Path("state")
     state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -232,4 +246,5 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         min_net_credit=float(min_net_credit),
 
         rollover_variant=int(rollover_variant),
+        lower_tf_minutes=int(lower_tf_minutes),
     )

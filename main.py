@@ -11,6 +11,7 @@ from candle_builder import TimeframeCandleBuilder
 from config import build_arg_parser, load_config
 from dashboard import DashboardPrinter, DashboardState
 from dhan_ws_client import DhanWSClient
+from dual_tf_signal_engine import DualTFSignalEngine
 from history_loader import fetch_intraday_1m_history
 from option_chain_engine import OptionChainEngine
 from option_signal_bridge import OptionDiscoveryConfig, OptionSignalBridge
@@ -56,6 +57,17 @@ def main() -> int:
     candle_builder = TimeframeCandleBuilder(cfg.timeframe_minutes)
     st_engine = SupertrendEngine(cfg.st_period, cfg.st_multiplier)
     signal_engine = SignalEngine(cfg.variant, cfg.sl_percent, state_manager)
+
+    # ── Variant 5: dual-TF setup ──────────────────────────────────────────────
+    ltf_candle_builder = None
+    ltf_st_engine      = None
+    dual_tf_engine     = None
+
+    if cfg.variant == 5:
+        ltf_candle_builder = TimeframeCandleBuilder(cfg.lower_tf_minutes)
+        ltf_st_engine      = SupertrendEngine(cfg.st_period, cfg.st_multiplier)
+        dual_tf_engine     = DualTFSignalEngine(sl_percent=cfg.sl_percent)
+        signal_engine.dual_tf_engine = dual_tf_engine
 
     option_chain_engine = OptionChainEngine(
         client_id=client_id,
@@ -279,6 +291,27 @@ def main() -> int:
             signal_engine.process_historical_candle(candle, st_result)
 
         state_manager.mark_indicator_seeded()
+
+        # ── Variant 5: also seed LTF candle builder ───────────────────────────
+        if cfg.variant == 5 and ltf_candle_builder is not None and dual_tf_engine is not None:
+            seeded_ltf = ltf_candle_builder.seed_from_1m_history(candles_1m)
+            dash_state.add_event(f"V5 LTF: seeded {seeded_ltf} x {cfg.lower_tf_minutes}m candles")
+
+            ltf_snap = ltf_candle_builder.snapshot()
+            ltf_history = list(reversed(ltf_snap.get("history", [])))
+            for candle in ltf_history:
+                r = ltf_st_engine.update(candle)
+                dual_tf_engine.process_ltf_historical(candle, r)
+
+            # HTF history (same candles as main engine)
+            for candle in history:
+                r = st_engine.snapshot()   # already updated above
+                dual_tf_engine.process_htf_historical(candle, st_engine.update(candle) if False else r)
+
+            dual_tf_engine.mark_htf_seeded()
+            dual_tf_engine.mark_ltf_seeded()
+            dash_state.add_event(f"V5 dual-TF warmup complete | HTF={cfg.timeframe_minutes}m LTF={cfg.lower_tf_minutes}m")
+
         dash_state.add_event("Indicator warmup complete from history")
         refresh_dashboard()
 
@@ -439,6 +472,11 @@ def main() -> int:
         try:
             closed_candles = candle_builder.on_tick(price, ltt_epoch)
 
+            # ── Variant 5: also route tick to LTF candle builder ──────────────
+            ltf_closed_candles = []
+            if cfg.variant == 5 and ltf_candle_builder is not None:
+                ltf_closed_candles = ltf_candle_builder.on_tick(price, ltt_epoch)
+
             refresh_dashboard(ltp=price, ltt_epoch=ltt_epoch)
 
             # Variant 1: 9:30 AM SL check (once per day)
@@ -454,12 +492,24 @@ def main() -> int:
 
             maybe_bootstrap_option_discovery()
 
+            # ── HTF candles (used for all variants) ───────────────────────────
             for candle in closed_candles:
                 st_result = st_engine.update(candle)
-                events = signal_engine.process_live_closed_candle(candle, st_result)
 
-                for event in events:
-                    dash_state.add_event(event)
+                if cfg.variant == 5 and dual_tf_engine is not None:
+                    # HTF candle: update dual_tf_engine HTF side
+                    htf_events = dual_tf_engine.process_htf_live(candle, st_result)
+                    for ev in htf_events:
+                        dash_state.add_event(f"[HTF] {ev}")
+                    # Also update current_trend on signal_engine for dashboard
+                    signal_engine.current_trend = dual_tf_engine.htf_trend
+                    signal_engine.current_flip_signal = dual_tf_engine.htf_signal
+                    signal_engine.current_st_value = dual_tf_engine.htf_st
+                    signal_engine.current_atr = dual_tf_engine.htf_atr
+                else:
+                    events = signal_engine.process_live_closed_candle(candle, st_result)
+                    for event in events:
+                        dash_state.add_event(event)
 
                 maybe_sync_paper_close()
 
@@ -467,8 +517,23 @@ def main() -> int:
                 candle_epoch = _get_candle_epoch(candle)
                 maybe_run_option_discovery(spot_price=candle_close, candle_epoch=candle_epoch)
                 maybe_run_flat_rescan(spot_price=candle_close, candle_epoch=candle_epoch)
-
                 refresh_dashboard(ltp=price, ltt_epoch=ltt_epoch)
+
+            # ── LTF candles (Variant 5 only) ──────────────────────────────────
+            if cfg.variant == 5 and dual_tf_engine is not None:
+                for candle in ltf_closed_candles:
+                    ltf_st_result = ltf_st_engine.update(candle)
+                    ltf_events = dual_tf_engine.process_ltf_live(candle, ltf_st_result)
+                    for ev in ltf_events:
+                        dash_state.add_event(f"[LTF] {ev}")
+
+                    maybe_sync_paper_close()
+
+                    candle_close = float(candle["close"])
+                    candle_epoch = _get_candle_epoch(candle)
+                    maybe_run_option_discovery(spot_price=candle_close, candle_epoch=candle_epoch)
+                    maybe_run_flat_rescan(spot_price=candle_close, candle_epoch=candle_epoch)
+                    refresh_dashboard(ltp=price, ltt_epoch=ltt_epoch)
 
         except Exception as e:
             msg = f"Tick processing error: {e}"
