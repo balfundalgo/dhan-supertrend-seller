@@ -137,6 +137,11 @@ class StrategyBridge:
         from signal_engine import SignalEngine
         from state_manager import StateManager
         from supertrend_engine import SupertrendEngine
+        from strategy_logger import (
+            log, log_debug, log_warn, log_error, log_section,
+            log_config, log_candle, log_signal_state,
+            log_option_snap, log_paper_snap, log_tick, get_log_path
+        )
         from datetime import timezone, timedelta
         from typing import Optional as Opt
 
@@ -145,14 +150,24 @@ class StrategyBridge:
         def ist_now():
             return datetime.now(tz=_IST)
 
+        log_section("STRATEGY START")
+        log_config(kwargs)
         self.post_event("Authenticating Dhan token...")
+        log("Authenticating Dhan token...")
         try:
             client_id, access_token = ensure_dhan_token()
             self.post_event(f"Token OK | client={client_id}")
+            log(f"Token OK | client={client_id}")
         except Exception as e:
             self.post_event(f"Token failed: {e}")
+            log_error(f"Token failed: {e}")
             self._running = False
             return
+
+        try:
+            self.post_event(f"Log file: {get_log_path()}")
+        except Exception:
+            pass
 
         tf   = int(kwargs.get("timeframe", 60))
         var  = int(kwargs.get("variant", 3))
@@ -222,6 +237,7 @@ class StrategyBridge:
             sl_ev = paper_mgr.update_live_quote(security_id, ltp, ltt)
             if sl_ev:
                 self.post_event(sl_ev)
+                log(f"SL ALERT: {sl_ev}")
                 if var in (1, 4) and paper_mgr.has_active():
                     pos = paper_mgr.snapshot().get("active_position") or {}
                     if pos.get("short_sl_hit"):
@@ -229,6 +245,8 @@ class StrategyBridge:
                             f"Variant {var}: SL breached on live tick"
                         )
                         self.post_event(msg)
+                        log(f"SL CLOSE: {msg}")
+                        log_paper_snap(paper_mgr.snapshot())
                         _sync_ws()
                         if var == 1:
                             v1_exit_today = True
@@ -264,12 +282,21 @@ class StrategyBridge:
 
         def _discover(*, spot, trend, prefix, epoch=None):
             nonlocal last_disc_epoch
+            log_section(f"OPTION DISCOVERY — {prefix.upper()}")
+            log(f"Attempting discovery | spot={spot:.2f} | trend={trend} | prefix={prefix}")
+            log_signal_state(signal_engine.snapshot())
             setup, reason = bridge_obj.discover_setup(spot_price=spot, trend=trend)
             self.post_event(f"{prefix} | {reason}")
+            log(f"Discovery result: {reason}")
             if setup is not None:
                 msg = paper_mgr.open_position(setup, spot_price=spot, sl_percent=slp)
                 self.post_event(msg)
+                log(f"PAPER OPEN: {msg}")
                 _sync_ws()
+                log_paper_snap(paper_mgr.snapshot())
+            else:
+                log_warn(f"No setup found — reason: {reason}")
+                log_option_snap(bridge_obj.snapshot())
             if epoch is not None:
                 last_disc_epoch = int(epoch)
             _push_snapshot()
@@ -279,6 +306,7 @@ class StrategyBridge:
             return n.hour > 10 or (n.hour == 10 and n.minute >= 15)
 
         # ── bootstrap ─────────────────────────────────────────────────────
+        log_section("BOOTSTRAP — HISTORY")
         self.post_event("Loading history...")
         candles_1m, hmsg = fetch_intraday_1m_history(
             client_id=client_id, access_token=access_token,
@@ -286,53 +314,73 @@ class StrategyBridge:
             lookback_days=5, limit=1500, instrument="INDEX",
         )
         self.post_event(hmsg)
+        log(hmsg)
         if candles_1m:
             n_tf = candle_builder.seed_from_1m_history(candles_1m)
             self.post_event(f"Seeded {n_tf} candles")
-            for c in reversed(list(candle_builder.snapshot().get("history",[]))):
+            log(f"Seeded {n_tf} x {tf}m candles from {len(candles_1m)} x 1m bars")
+            hist_list = list(reversed(candle_builder.snapshot().get("history",[])))
+            for c in hist_list:
                 r = st_engine.update(c)
                 signal_engine.process_historical_candle(c, r)
             state_manager.mark_indicator_seeded()
+            # Log final state after warmup
+            sig_snap = signal_engine.snapshot()
+            log(f"Post-warmup | trend={sig_snap.get('trend')} | signal={sig_snap.get('signal')} | "
+                f"active={sig_snap.get('active')} | sig_hi={sig_snap.get('signal_candle_high')} | "
+                f"sig_lo={sig_snap.get('signal_candle_low')}")
 
             # Variant 5: seed LTF as well
             if var == 5 and ltf_candle_builder is not None and dual_tf_engine_obj is not None:
                 n_ltf = ltf_candle_builder.seed_from_1m_history(candles_1m)
                 self.post_event(f"V5 LTF: seeded {n_ltf} x {ltf}m candles")
+                log(f"V5 LTF seeded {n_ltf} x {ltf}m candles")
                 for c in reversed(list(ltf_candle_builder.snapshot().get("history", []))):
                     r = ltf_st_engine.update(c)
                     dual_tf_engine_obj.process_ltf_historical(c, r)
-                # HTF historical already done via signal_engine above — mark seeded
                 for c in reversed(list(candle_builder.snapshot().get("history", []))):
                     r2 = st_engine.update(c)
                     dual_tf_engine_obj.process_htf_historical(c, r2)
                 dual_tf_engine_obj.mark_htf_seeded()
                 dual_tf_engine_obj.mark_ltf_seeded()
+                v5snap = dual_tf_engine_obj.snapshot()
                 self.post_event(f"V5 dual-TF warmup complete | HTF={tf}m LTF={ltf}m")
+                log(f"V5 post-warmup | HTF trend={v5snap.get('htf_trend')} | LTF trend={v5snap.get('ltf_trend')}")
 
             self.post_event("Warmup complete")
+            log_section("BOOTSTRAP — OPTION CHAIN")
 
         self.post_event("Fetching expiry list...")
+        log("Fetching expiry list from Dhan API...")
         for attempt in range(1, 6):
             try:
                 emsg = bridge_obj.refresh_master()
                 expiry_list = bridge_obj.last_expiry_info.get("all") or []
                 if expiry_list:
                     self.post_event(emsg)
+                    log(emsg)
                     break
                 else:
                     wait = 2 ** attempt
                     self.post_event(f"Expiry list empty, retry {attempt}/5 in {wait}s...")
+                    log_warn(f"Expiry list empty, retry {attempt}/5 in {wait}s...")
                     time.sleep(wait)
             except Exception as e:
                 wait = 2 ** attempt
                 self.post_event(f"Expiry fetch error: {e} — retry {attempt}/5 in {wait}s...")
+                log_error(f"Expiry fetch error: {e} — retry {attempt}/5 in {wait}s...")
                 time.sleep(wait)
         else:
-            self.post_event("⚠ Expiry list unavailable after 5 attempts — discovery will retry on each candle close")
+            msg = "⚠ Expiry list unavailable after 5 attempts — discovery will retry on each candle close"
+            self.post_event(msg)
+            log_warn(msg)
 
         expiry_list = bridge_obj.last_expiry_info.get("all") or []
         if expiry_list:
-            self.post_event(rollover_info(expiry_list))
+            rinfo = rollover_info(expiry_list)
+            self.post_event(rinfo)
+            log(rinfo)
+        log_option_snap(bridge_obj.snapshot())
 
         _push_snapshot()
 
@@ -342,6 +390,8 @@ class StrategyBridge:
 
             if self._stop_event.is_set():
                 return
+
+            log_tick(price, ltt_epoch, interval=100)
 
             closed = candle_builder.on_tick(price, ltt_epoch)
 
@@ -359,11 +409,13 @@ class StrategyBridge:
             if var == 1 and n.hour == 9 and n.minute == 30 and _930_done != today:
                 _930_done = today
                 v1_exit_today = False
+                log("9:30 AM SL check triggered (Variant 1)")
                 if paper_mgr.has_active():
                     pos = paper_mgr.snapshot().get("active_position") or {}
                     if pos.get("short_sl_hit"):
                         msg = paper_mgr.close_active_position("V1: 9:30 gap-up SL check")
                         self.post_event(msg)
+                        log(f"V1 9:30 SL close: {msg}")
                         _sync_ws()
                         v1_exit_today = True
 
@@ -379,9 +431,11 @@ class StrategyBridge:
                 if triggered:
                     _rollover_done = today
                     self.post_event(f"Rollover V{rv} triggered @ 3 PM IST")
+                    log(f"ROLLOVER V{rv} triggered")
                     if paper_mgr.has_active():
                         msg = paper_mgr.close_active_position("Rollover close")
                         self.post_event(msg)
+                        log(f"Rollover close: {msg}")
                         _sync_ws()
                     trend = _actionable_trend()
                     if trend and price:
@@ -390,19 +444,25 @@ class StrategyBridge:
             # bootstrap discovery
             if not boot_done:
                 trend = _actionable_trend()
+                log(f"Bootstrap discovery check | actionable_trend={trend} | has_active={paper_mgr.has_active()}")
+                log_signal_state(signal_engine.snapshot())
                 if trend and not paper_mgr.has_active():
                     _discover(spot=float(price), trend=trend, prefix="Bootstrap")
                     last_active = signal_engine.snapshot().get("active")
+                elif not trend:
+                    log_warn("Bootstrap: no actionable trend yet — waiting for signal")
                 boot_done = True
 
             # ── HTF candles ───────────────────────────────────────────────────
             for candle in closed:
                 r = st_engine.update(candle)
+                log_candle(f"HTF CANDLE CLOSE ({tf}m)", candle, r)
 
                 if var == 5 and dual_tf_engine_obj is not None:
                     htf_evs = dual_tf_engine_obj.process_htf_live(candle, r)
                     for ev in htf_evs:
                         self.post_event(f"[HTF] {ev}")
+                        log(f"[HTF] {ev}")
                     signal_engine.current_trend  = dual_tf_engine_obj.htf_trend
                     signal_engine.current_flip_signal = dual_tf_engine_obj.htf_signal
                     signal_engine.current_st_value = dual_tf_engine_obj.htf_st
@@ -411,15 +471,18 @@ class StrategyBridge:
                     events = signal_engine.process_live_closed_candle(candle, r)
                     for ev in events:
                         self.post_event(ev)
+                        log(f"SIGNAL EVENT: {ev}")
 
-                    # sync paper close (variants 1-4)
                     sig = signal_engine.snapshot()
+                    log_signal_state(sig)
                     cur_active = sig.get("active")
+
                     if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
                         if paper_mgr.has_active():
                             reason = sig.get("last_event") or "Signal exit"
                             msg = paper_mgr.close_active_position(reason)
                             self.post_event(msg)
+                            log(f"PAPER CLOSE: {msg}")
                             _sync_ws()
                             if var == 1:
                                 v1_exit_today = True
@@ -429,17 +492,23 @@ class StrategyBridge:
                     ep  = _candle_epoch(candle)
                     flip = sig.get("signal")
                     if flip in ("BUY","SELL") and flip != last_flip:
+                        log(f"FLIP SIGNAL detected: {flip} | v1_gate={var==1 and v1_exit_today and not _after_1015()}")
                         if not (var == 1 and v1_exit_today and not _after_1015()):
                             _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
+                        else:
+                            log_warn(f"Flip discovery blocked — V1 exit today and before 10:15 AM")
                         last_flip = flip
                     elif flip in (None,"","-"):
                         last_flip = None
 
                     if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
+                        trend = _actionable_trend()
+                        log_debug(f"Flat rescan check | trend={trend} | last_disc_epoch={last_disc_epoch} | ep={ep}")
                         if not (var == 1 and v1_exit_today and not _after_1015()):
-                            trend = _actionable_trend()
                             if trend and last_disc_epoch != ep:
                                 _discover(spot=cc, trend=trend, prefix="Flat rescan", epoch=ep)
+                    elif sig.get("waiting_reentry"):
+                        log_debug(f"Waiting re-entry | trend={sig.get('trend')} | sig_hi={sig.get('signal_candle_high')} | close={candle.get('close')}")
 
                 _push_snapshot()
 
@@ -447,17 +516,21 @@ class StrategyBridge:
             if var == 5 and dual_tf_engine_obj is not None:
                 for candle in ltf_closed:
                     ltf_r = ltf_st_engine.update(candle)
+                    log_candle(f"LTF CANDLE CLOSE ({ltf}m)", candle, ltf_r)
                     ltf_evs = dual_tf_engine_obj.process_ltf_live(candle, ltf_r)
                     for ev in ltf_evs:
                         self.post_event(f"[LTF] {ev}")
+                        log(f"[LTF] {ev}")
 
                     sig = signal_engine.snapshot()
+                    log_signal_state(sig)
                     cur_active = sig.get("active")
                     if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
                         if paper_mgr.has_active():
                             reason = sig.get("last_event") or "LTF exit"
                             msg = paper_mgr.close_active_position(reason)
                             self.post_event(msg)
+                            log(f"PAPER CLOSE (LTF): {msg}")
                             _sync_ws()
                     last_active = cur_active
 
@@ -473,6 +546,7 @@ class StrategyBridge:
 
         def on_status(msg):
             self.post_event(msg)
+            log(f"WS STATUS: {msg}")
 
         ws = DhanWSClient(
             client_id=client_id, access_token=access_token,
@@ -539,6 +613,32 @@ class TokenTab(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self._on_token_saved = on_token_saved
         self._build()
+        self._auto_load_credentials()
+
+    def _auto_load_credentials(self) -> None:
+        """Auto-fill credentials from .env on startup if available."""
+        try:
+            from dotenv import load_dotenv
+            from dhan_token_manager import ENV_FILE
+            load_dotenv(ENV_FILE, override=False)
+            cid  = os.getenv("DHAN_CLIENT_ID","").strip()
+            pin  = os.getenv("DHAN_PIN","").strip()
+            totp = os.getenv("DHAN_TOTP_SECRET","").strip()
+            if cid:
+                self._entries["Client ID"].delete(0,"end")
+                self._entries["Client ID"].insert(0, cid)
+            if pin:
+                self._entries["PIN"].delete(0,"end")
+                self._entries["PIN"].insert(0, pin)
+            if totp:
+                self._entries["TOTP Secret"].delete(0,"end")
+                self._entries["TOTP Secret"].insert(0, totp)
+            if cid:
+                self._status.configure(
+                    text="✅ Credentials auto-loaded from .env", text_color=GREEN
+                )
+        except Exception:
+            pass
 
     def _build(self):
         wrap = _card(self)
@@ -638,11 +738,18 @@ class TokenTab(ctk.CTkFrame):
 
         def _run():
             try:
-                from dhan_token_manager import generate_token_via_totp, save_token_to_env
+                from dhan_token_manager import generate_token_via_totp, save_token_to_env, _save_env_key
                 result = generate_token_via_totp(client_id, pin, totp_secret)
                 if result.get("success"):
                     token = result["access_token"]
                     save_token_to_env(token, result.get("expiry", ""))
+                    # Also persist credentials so they auto-load next time
+                    try:
+                        _save_env_key("DHAN_CLIENT_ID", client_id)
+                        _save_env_key("DHAN_PIN", pin)
+                        _save_env_key("DHAN_TOTP_SECRET", totp_secret)
+                    except Exception:
+                        pass
                     os.environ["DHAN_ACCESS_TOKEN"] = token
                     self._show_token(token, f"✅ Token generated | Expires: {result.get('expiry','')[:19]}")
                     if self._on_token_saved:
@@ -761,13 +868,41 @@ class SetupTab(ctk.CTkFrame):
     def __init__(self, parent):
         super().__init__(parent, fg_color="transparent")
         self._build()
+        self._auto_load()   # load saved params on startup
+
+    # ── params file path (next to exe / script) ───────────────────────────────
+    @staticmethod
+    def _params_path():
+        import sys, json
+        from pathlib import Path
+        base = Path(sys.executable).parent if getattr(sys, 'frozen', False) \
+               else Path(__file__).resolve().parent
+        return base / "saved_params.json"
 
     def _build(self):
         canvas = ctk.CTkScrollableFrame(self, fg_color="transparent")
         canvas.pack(fill="both", expand=True, padx=8, pady=8)
 
         _label(canvas, "Strategy Configuration", font=FONT_LG).pack(pady=(12,2))
-        _label(canvas, "All parameters. Changes take effect on next Start.", color=MUTED).pack(pady=(0,16))
+        _label(canvas, "All parameters. Changes take effect on next Start.", color=MUTED).pack(pady=(0,4))
+
+        # ── Save / Load buttons ───────────────────────────────────────────────
+        btn_row = ctk.CTkFrame(canvas, fg_color="transparent")
+        btn_row.pack(pady=(0, 12))
+
+        ctk.CTkButton(
+            btn_row, text="💾  Save Parameters", command=self._save_params,
+            fg_color="#14532d", hover_color=GREEN, width=180, height=30,
+        ).pack(side="left", padx=6)
+
+        ctk.CTkButton(
+            btn_row, text="📂  Load Saved", command=self._load_params,
+            fg_color=PANEL_BG, hover_color=BORDER, border_color=BORDER,
+            border_width=1, width=140, height=30,
+        ).pack(side="left", padx=6)
+
+        self._save_status = _label(btn_row, "", color=MUTED, font=FONT_SM)
+        self._save_status.pack(side="left", padx=10)
 
         # ── two column layout ──────────────────────────────────────────────
         cols = ctk.CTkFrame(canvas, fg_color="transparent")
@@ -918,6 +1053,155 @@ class SetupTab(ctk.CTkFrame):
             "min_net_credit":    float(self.var_min_credit.get()),
         }
 
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _save_params(self) -> None:
+        import json
+        try:
+            data = self.get_config()
+            # Store variant and rollover as full display string for easy restore
+            data["_variant_str"]   = self.var_variant.get()
+            data["_rollover_str"]  = self.var_rollover.get()
+            data["_expiry_mode"]   = self.var_expiry_mode.get()
+            data["_otm_steps"]     = self.var_otm_steps.get()
+            self._params_path().write_text(
+                json.dumps(data, indent=2), encoding="utf-8"
+            )
+            self._save_status.configure(
+                text=f"✅ Saved to {self._params_path().name}", text_color=GREEN
+            )
+        except Exception as e:
+            self._save_status.configure(text=f"❌ Save failed: {e}", text_color=RED)
+
+    def _load_params(self) -> None:
+        import json
+        try:
+            if not self._params_path().exists():
+                self._save_status.configure(
+                    text="⚠ No saved parameters found", text_color=YELLOW
+                )
+                return
+            data = json.loads(self._params_path().read_text(encoding="utf-8"))
+            self._apply_params(data)
+            self._save_status.configure(
+                text=f"✅ Loaded from {self._params_path().name}", text_color=GREEN
+            )
+        except Exception as e:
+            self._save_status.configure(text=f"❌ Load failed: {e}", text_color=RED)
+
+    def _apply_params(self, data: dict) -> None:
+        """Apply a params dict to all GUI widgets."""
+        try:
+            tf = str(data.get("timeframe", "60"))
+            if tf in [self.var_timeframe.cget("values") if hasattr(self.var_timeframe, "cget") else []]:
+                pass
+            self.var_timeframe.set(tf)
+        except Exception:
+            pass
+
+        # Variant — prefer full string, fall back to number prefix match
+        try:
+            vs = data.get("_variant_str") or ""
+            if not vs:
+                vn = str(data.get("variant", "3"))
+                for opt in ["1 — SL% + ST change","2 — ST change only",
+                            "3 — Candle breach + ST change","4 — Candle breach + SL%",
+                            "5 — Dual TF Trailing (HTF entry + LTF exit)"]:
+                    if opt.startswith(vn + " "):
+                        vs = opt
+                        break
+            if vs:
+                self.var_variant.set(vs)
+        except Exception:
+            pass
+
+        try:
+            self.var_st_period.delete(0, "end")
+            self.var_st_period.insert(0, str(data.get("st_period", "10")))
+        except Exception:
+            pass
+
+        try:
+            self.var_st_mult.delete(0, "end")
+            self.var_st_mult.insert(0, str(data.get("st_multiplier", "3.0")))
+        except Exception:
+            pass
+
+        try:
+            self.var_sl_pct.set(float(data.get("sl_percent", 30)))
+        except Exception:
+            pass
+
+        try:
+            em = data.get("_expiry_mode") or data.get("expiry_mode", "AUTO")
+            self.var_expiry_mode.set(str(em))
+        except Exception:
+            pass
+
+        try:
+            ots = data.get("_otm_steps") or data.get("otm_steps", "3,4,5,6")
+            self.var_otm_steps.set(str(ots))
+        except Exception:
+            pass
+
+        # Rollover — prefer full string
+        try:
+            rs = data.get("_rollover_str") or ""
+            if not rs:
+                rn = str(data.get("rollover_variant", "2"))
+                for opt in ["1 — 3rd weekly expiry @ 3 PM",
+                            "2 — 4 trading days before expiry"]:
+                    if opt.startswith(rn + " "):
+                        rs = opt
+                        break
+            if rs:
+                self.var_rollover.set(rs)
+        except Exception:
+            pass
+
+        try:
+            self.var_lower_tf.set(str(data.get("lower_tf_minutes", "15")))
+        except Exception:
+            pass
+
+        try:
+            self.var_min_short.set(float(data.get("min_short_premium", 200)))
+        except Exception:
+            pass
+
+        try:
+            self.var_max_short.set(float(data.get("max_short_premium", 300)))
+        except Exception:
+            pass
+
+        try:
+            self.var_min_hedge.set(float(data.get("min_hedge_premium", 100)))
+        except Exception:
+            pass
+
+        try:
+            self.var_max_hedge.set(float(data.get("max_hedge_premium", 200)))
+        except Exception:
+            pass
+
+        try:
+            self.var_min_credit.set(float(data.get("min_net_credit", 150)))
+        except Exception:
+            pass
+
+    def _auto_load(self) -> None:
+        """Silently load saved params on startup if file exists."""
+        import json
+        try:
+            if self._params_path().exists():
+                data = json.loads(self._params_path().read_text(encoding="utf-8"))
+                self._apply_params(data)
+                self._save_status.configure(
+                    text="✅ Parameters auto-loaded", text_color=GREEN
+                )
+        except Exception:
+            pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab 3 — Live Dashboard
@@ -982,7 +1266,13 @@ class DashboardTab(ctk.CTkFrame):
         # ── bottom: event log ─────────────────────────────────────────────
         ecard = _card(self)
         ecard.pack(fill="x", padx=12, pady=(0,8))
-        _label(ecard, "Strategy Events", font=FONT_MD).pack(pady=(8,4), anchor="w", padx=12)
+
+        evhdr = ctk.CTkFrame(ecard, fg_color="transparent")
+        evhdr.pack(fill="x", padx=12, pady=(8,2))
+        _label(evhdr, "Strategy Events", font=FONT_MD).pack(side="left")
+        self._log_path_lbl = _label(evhdr, "Log: not started", color=MUTED,
+                                    font=("Segoe UI", 9))
+        self._log_path_lbl.pack(side="right")
 
         self._event_box = ctk.CTkTextbox(
             ecard, height=160, fg_color=PANEL_BG, text_color=MUTED,
@@ -1114,6 +1404,16 @@ class DashboardTab(ctk.CTkFrame):
         for ev in (events or [])[:30]:
             self._event_box.insert("end", ev + "\n")
         self._event_box.configure(state="disabled")
+
+        # update log file path label from events
+        try:
+            for ev in (events or []):
+                if "Log file:" in ev:
+                    path = ev.split("Log file:")[-1].strip()
+                    self._log_path_lbl.configure(text=f"Log: {path}", text_color=GREEN)
+                    break
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

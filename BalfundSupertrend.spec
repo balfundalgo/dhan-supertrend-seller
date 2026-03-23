@@ -21,6 +21,7 @@ a = Analysis(
         'websocket._app',
         'websocket._core',
         'dotenv',
+        'strategy_logger',
         *collect_submodules('customtkinter'),
     ],
     hookspath=[],
