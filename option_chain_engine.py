@@ -87,12 +87,30 @@ class OptionChainEngine:
         if gap < self.min_unique_request_gap_sec:
             time.sleep(self.min_unique_request_gap_sec - gap)
 
-    def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        self._respect_rate_limit()
-        r = requests.post(url, headers=self._headers(), json=payload, timeout=20)
-        self._last_request_ts = time.time()
-        r.raise_for_status()
-        return r.json()
+    def _post_json(self, url: str, payload: Dict[str, Any], retries: int = 4) -> Dict[str, Any]:
+        last_exc = None
+        for attempt in range(retries):
+            self._respect_rate_limit()
+            try:
+                r = requests.post(url, headers=self._headers(), json=payload, timeout=20)
+                self._last_request_ts = time.time()
+                if r.status_code in (500, 502, 503, 504):
+                    wait = 2 ** attempt  # 1s, 2s, 4s, 8s
+                    time.sleep(wait)
+                    last_exc = Exception(f"HTTP {r.status_code} {r.reason} (attempt {attempt+1}/{retries})")
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except requests.exceptions.Timeout:
+                last_exc = Exception(f"Timeout (attempt {attempt+1}/{retries})")
+                time.sleep(2 ** attempt)
+            except requests.exceptions.ConnectionError as e:
+                last_exc = Exception(f"Connection error: {e} (attempt {attempt+1}/{retries})")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                self._last_request_ts = time.time()
+                raise
+        raise last_exc or Exception("Request failed after retries")
 
     # ------------------------------------------------------------------
     # Expiry list
@@ -113,13 +131,16 @@ class OptionChainEngine:
         try:
             data = self._post_json(self.EXPIRYLIST_URL, payload)
         except Exception as e:
-            return [], f"Expiry list fetch failed: {e}"
+            return [], f"Expiry list fetch failed (will retry on next candle): {e}"
 
         expiries = data.get("data", [])
         if not isinstance(expiries, list):
             return [], "Expiry list response malformed"
 
         expiries = [str(x) for x in expiries if str(x).strip()]
+        if not expiries:
+            return [], "Expiry list returned empty — will retry on next candle"
+
         self._expiry_cache = expiries
         self._expiry_cache_ts = time.time()
         return list(expiries), f"Expiry list ok: {len(expiries)} expiries"
@@ -147,7 +168,7 @@ class OptionChainEngine:
         try:
             data = self._post_json(self.OPTIONCHAIN_URL, payload)
         except Exception as e:
-            return None, f"Option chain fetch failed for {expiry}: {e}"
+            return None, f"Option chain fetch failed for {expiry} (will retry): {e}"
 
         self._chain_cache[expiry] = (time.time(), data)
         root = data.get("data", {})
@@ -158,11 +179,12 @@ class OptionChainEngine:
     # ------------------------------------------------------------------
     # Expiry classification
     # ------------------------------------------------------------------
-    def get_expiry_buckets(self) -> Tuple[Dict[str, Optional[str]], str]:
-        expiries, msg = self.get_expiry_list()
+    def get_expiry_buckets(self, force_refresh: bool = False) -> Tuple[Dict[str, Optional[str]], str]:
+        expiries, msg = self.get_expiry_list(force_refresh=force_refresh)
         if not expiries:
             return {"current": None, "next": None, "far": None, "all": []}, msg
 
+        # Parse all expiry strings into (date, str) pairs
         parsed = []
         for x in expiries:
             try:
@@ -174,32 +196,45 @@ class OptionChainEngine:
 
         today = date.today()
 
-        current = None
+        # ── Group by (year, month) and take the LAST date in each group ──────
+        # Last expiry of each month = monthly expiry (last Thursday of month)
+        from collections import OrderedDict
+        month_groups: dict = OrderedDict()
         for d, x in parsed:
+            key = (d.year, d.month)
+            # keep replacing — last one in sorted order wins = monthly expiry
+            month_groups[key] = (d, x)
+
+        # Sorted list of monthly expiries: [(date, str), ...]
+        monthly = sorted(month_groups.values(), key=lambda t: t[0])
+
+        # current = last expiry of current month (or nearest future month)
+        current = None
+        for d, x in monthly:
             if d >= today:
                 current = (d, x)
                 break
-        if current is None and parsed:
-            current = parsed[0]
+        # If all monthly expiries are in the past, take the last one
+        if current is None and monthly:
+            current = monthly[-1]
 
+        # next = last expiry of the month immediately after current's month
         next_exp = None
-        far_exp = None
-
         if current is not None:
-            cy, cm = current[0].year, current[0].month
-            for d, x in parsed:
-                if d <= current[0]:
-                    continue
-                if d.year != cy or d.month != cm:
+            for d, x in monthly:
+                if d.year > current[0].year or (
+                    d.year == current[0].year and d.month > current[0].month
+                ):
                     next_exp = (d, x)
                     break
 
+        # far = last expiry of the month immediately after next's month
+        far_exp = None
         if next_exp is not None:
-            ny, nm = next_exp[0].year, next_exp[0].month
-            for d, x in parsed:
-                if d <= next_exp[0]:
-                    continue
-                if d.year != ny or d.month != nm:
+            for d, x in monthly:
+                if d.year > next_exp[0].year or (
+                    d.year == next_exp[0].year and d.month > next_exp[0].month
+                ):
                     far_exp = (d, x)
                     break
 
