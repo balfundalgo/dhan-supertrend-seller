@@ -118,6 +118,7 @@ class StrategyBridge:
         os.environ["OPTION_OTM_STEPS"]          = str(kwargs.get("otm_steps", "3,4,5,6"))
         os.environ["ROLLOVER_VARIANT"]          = str(kwargs.get("rollover_variant", 2))
         os.environ["LOWER_TF_MINUTES"]          = str(kwargs.get("lower_tf_minutes", 15))
+        os.environ["GLOBAL_SL_RUPEES"]          = str(kwargs.get("global_sl_rupees", 0))
         os.environ["MIN_SHORT_PREMIUM"]         = str(kwargs.get("min_short_premium", 200))
         os.environ["MAX_SHORT_PREMIUM"]         = str(kwargs.get("max_short_premium", 300))
         os.environ["MIN_HEDGE_PREMIUM"]         = str(kwargs.get("min_hedge_premium", 50))
@@ -173,9 +174,10 @@ class StrategyBridge:
         var  = int(kwargs.get("variant", 3))
         stp  = int(kwargs.get("st_period", 10))
         stm  = float(kwargs.get("st_multiplier", 3.0))
-        slp  = float(kwargs.get("sl_percent", 30.0))
-        ltf  = int(kwargs.get("lower_tf_minutes", 15))
-        seg  = "IDX_I"
+        slp        = float(kwargs.get("sl_percent", 30.0))
+        ltf        = int(kwargs.get("lower_tf_minutes", 15))
+        global_sl  = float(kwargs.get("global_sl_rupees", 0.0))  # 0 = disabled
+        seg        = "IDX_I"
         sid  = "13"    # NIFTY
 
         state_manager   = StateManager("state/runtime_state.json", tf, stp, stm)
@@ -228,12 +230,71 @@ class StrategyBridge:
         last_active      = None
         boot_done        = False
         last_disc_epoch  = None
+        _global_sl_hit   = False    # True = global SL triggered today → no new trades
+        _global_sl_date  = None     # date on which it triggered (reset next day)
 
         def _sync_ws():
             option_ws.set_instruments(paper_mgr.active_option_watchlist())
 
+        def _day_pnl_rupees() -> float:
+            """Total realized + unrealized P&L for today in rupees."""
+            try:
+                snap = paper_mgr.snapshot()
+                pos  = snap.get("active_position") or {}
+                real = float(pos.get("pnl_rupees") or 0.0)
+                hist = snap.get("history") or []
+                # sum realized from today's closed trades
+                from datetime import datetime as _dt
+                today_str = _dt.now().strftime("%Y-%m-%d")
+                closed_today = sum(
+                    float(h.get("pnl_estimate") or 0.0) * float(snap.get("lot_size", 75))
+                    for h in hist
+                    if str(h.get("exit_time", "")).startswith(today_str)
+                )
+                return real + closed_today
+            except Exception:
+                return 0.0
+
+        def _check_global_sl() -> bool:
+            """
+            Returns True if global SL is active (already hit today).
+            If SL just breached, closes position, logs, fires dashboard alert.
+            """
+            nonlocal _global_sl_hit, _global_sl_date
+            today = ist_now().date()
+
+            # reset flag on new day
+            if _global_sl_date != today:
+                _global_sl_hit  = False
+                _global_sl_date = today
+
+            if _global_sl_hit:
+                return True  # already hit today
+
+            if global_sl <= 0:
+                return False  # disabled
+
+            pnl = _day_pnl_rupees()
+            if pnl <= -abs(global_sl):
+                _global_sl_hit = True
+                _global_sl_date = today
+                msg = (
+                    f"🛑 GLOBAL SL HIT | day P&L = ₹{pnl:.0f} "
+                    f"≤ -₹{global_sl:.0f} | closing position & stopping trades for today"
+                )
+                self.post_event(msg)
+                log(f"GLOBAL SL: {msg}")
+                if paper_mgr.has_active():
+                    close_msg = paper_mgr.close_active_position("Global daily SL hit")
+                    self.post_event(close_msg)
+                    log(f"GLOBAL SL CLOSE: {close_msg}")
+                    _sync_ws()
+                return True
+
+            return False
+
         def _on_opt_tick(security_id, ltp, ltt):
-            nonlocal v1_exit_today
+            nonlocal v1_exit_today, _global_sl_hit, _global_sl_date
             sl_ev = paper_mgr.update_live_quote(security_id, ltp, ltt)
             if sl_ev:
                 self.post_event(sl_ev)
@@ -250,6 +311,8 @@ class StrategyBridge:
                         _sync_ws()
                         if var == 1:
                             v1_exit_today = True
+            # Also check global SL after every MTM update
+            _check_global_sl()
             _push_snapshot()
 
         def _push_snapshot():
@@ -387,6 +450,7 @@ class StrategyBridge:
         # ── tick handler ──────────────────────────────────────────────────
         def on_tick(price, ltt_epoch):
             nonlocal v1_exit_today, _930_done, _rollover_done, last_flip, last_active, boot_done
+            nonlocal _global_sl_hit, _global_sl_date
 
             if self._stop_event.is_set():
                 return
@@ -404,6 +468,14 @@ class StrategyBridge:
 
             today = ist_now().date()
             n = ist_now()
+
+            # Reset per-day flags at start of new day
+            if _global_sl_date != today:
+                _global_sl_hit  = False
+                _global_sl_date = today
+
+            # Check global SL on every tick (catches intraday breach)
+            _check_global_sl()
 
             # 9:30 AM Variant 1 check
             if var == 1 and n.hour == 9 and n.minute == 30 and _930_done != today:
@@ -446,7 +518,7 @@ class StrategyBridge:
                 trend = _actionable_trend()
                 log(f"Bootstrap discovery check | actionable_trend={trend} | has_active={paper_mgr.has_active()}")
                 log_signal_state(signal_engine.snapshot())
-                if trend and not paper_mgr.has_active():
+                if trend and not paper_mgr.has_active() and not _check_global_sl():
                     _discover(spot=float(price), trend=trend, prefix="Bootstrap")
                     last_active = signal_engine.snapshot().get("active")
                 elif not trend:
@@ -494,7 +566,8 @@ class StrategyBridge:
                     if flip in ("BUY","SELL") and flip != last_flip:
                         log(f"FLIP SIGNAL detected: {flip} | v1_gate={var==1 and v1_exit_today and not _after_1015()}")
                         if not (var == 1 and v1_exit_today and not _after_1015()):
-                            _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
+                            if not _check_global_sl():
+                                _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
                         else:
                             log_warn(f"Flip discovery blocked — V1 exit today and before 10:15 AM")
                         last_flip = flip
@@ -505,7 +578,7 @@ class StrategyBridge:
                         trend = _actionable_trend()
                         log_debug(f"Flat rescan check | trend={trend} | last_disc_epoch={last_disc_epoch} | ep={ep}")
                         if not (var == 1 and v1_exit_today and not _after_1015()):
-                            if trend and last_disc_epoch != ep:
+                            if trend and last_disc_epoch != ep and not _check_global_sl():
                                 _discover(spot=cc, trend=trend, prefix="Flat rescan", epoch=ep)
                     elif sig.get("waiting_reentry"):
                         log_debug(f"Waiting re-entry | trend={sig.get('trend')} | sig_hi={sig.get('signal_candle_high')} | close={candle.get('close')}")
@@ -539,7 +612,7 @@ class StrategyBridge:
 
                     if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
                         trend = _actionable_trend()
-                        if trend and last_disc_epoch != ep:
+                        if trend and last_disc_epoch != ep and not _check_global_sl():
                             _discover(spot=cc, trend=trend, prefix="V5 LTF entry", epoch=ep)
 
                     _push_snapshot()
@@ -970,6 +1043,30 @@ class SetupTab(ctk.CTkFrame):
         self.var_max_hedge    = self._slider(right, "Max Hedge Premium", 100, 400, 200)
         self.var_min_credit   = self._slider(right, "Min Net Credit",    150, 400, 150)
 
+        # ── Global Stop Loss ──────────────────────────────────────────────────
+        sep2 = ctk.CTkFrame(right, fg_color=BORDER, height=1)
+        sep2.pack(fill="x", padx=16, pady=(12, 6))
+
+        gsl_row = ctk.CTkFrame(right, fg_color=CARD_BG, corner_radius=8)
+        gsl_row.pack(fill="x", padx=16, pady=(0, 12))
+        gsl_inner = ctk.CTkFrame(gsl_row, fg_color="transparent")
+        gsl_inner.pack(fill="x", padx=12, pady=8)
+        gsl_inner.columnconfigure(1, weight=1)
+
+        _label(gsl_inner, "🛑  Global Daily SL (₹)",
+               font=FONT_MD, color=RED).grid(row=0, column=0, sticky="w")
+        self.var_global_sl = ctk.CTkEntry(
+            gsl_inner, width=120,
+            fg_color=PANEL_BG, border_color=RED,
+            text_color=WHITE, placeholder_text_color=MUTED,
+            placeholder_text="e.g. 5000",
+        )
+        self.var_global_sl.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        _label(right,
+               "If day's realized+unrealized P&L drops below -₹ this value,\n"
+               "close position and stop all trades for the day.",
+               color=MUTED, font=("Segoe UI", 9)).pack(padx=16, anchor="w", pady=(0, 8))
+
     # ── helpers ────────────────────────────────────────────────────────────
     def _entry_field(self, parent, label, default="") -> ctk.CTkEntry:
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1036,6 +1133,13 @@ class SetupTab(ctk.CTkFrame):
             except Exception:
                 return default
 
+        def _safe_positive(s, default):
+            try:
+                v = float(str(s).strip())
+                return v if v > 0 else default
+            except Exception:
+                return default
+
         return {
             "timeframe":         int(self.var_timeframe.get()),
             "variant":           _variant_num(self.var_variant.get()),
@@ -1051,6 +1155,7 @@ class SetupTab(ctk.CTkFrame):
             "min_hedge_premium": float(self.var_min_hedge.get()),
             "max_hedge_premium": float(self.var_max_hedge.get()),
             "min_net_credit":    float(self.var_min_credit.get()),
+            "global_sl_rupees":  _safe_positive(self.var_global_sl.get(), 0.0),
         }
 
     # ── Persistence ───────────────────────────────────────────────────────────
@@ -1064,6 +1169,7 @@ class SetupTab(ctk.CTkFrame):
             data["_rollover_str"]  = self.var_rollover.get()
             data["_expiry_mode"]   = self.var_expiry_mode.get()
             data["_otm_steps"]     = self.var_otm_steps.get()
+            data["_global_sl"]     = self.var_global_sl.get().strip()
             self._params_path().write_text(
                 json.dumps(data, indent=2), encoding="utf-8"
             )
@@ -1189,6 +1295,14 @@ class SetupTab(ctk.CTkFrame):
         except Exception:
             pass
 
+        try:
+            gsl = data.get("_global_sl") or str(data.get("global_sl_rupees", ""))
+            if gsl and str(gsl) != "0.0" and str(gsl) != "0":
+                self.var_global_sl.delete(0, "end")
+                self.var_global_sl.insert(0, str(gsl))
+        except Exception:
+            pass
+
     def _auto_load(self) -> None:
         """Silently load saved params on startup if file exists."""
         import json
@@ -1234,6 +1348,19 @@ class DashboardTab(ctk.CTkFrame):
         self._lbl_active  = stat_card(3, "Active Position")
         self._lbl_pnl_pts = stat_card(4, "P&L (pts)")
         self._lbl_pnl_rs  = stat_card(5, "P&L (₹)")
+
+        # ── Global SL banner (hidden until triggered) ─────────────────────────
+        self._gsl_banner = ctk.CTkFrame(
+            self, fg_color="#7f1d1d", corner_radius=8, height=36
+        )
+        # not packed yet — only shown when triggered
+        self._gsl_banner_lbl = _label(
+            self._gsl_banner,
+            "🛑  GLOBAL SL HIT — Position Closed. No new trades today.",
+            font=("Segoe UI", 13, "bold"), color=WHITE,
+        )
+        self._gsl_banner_lbl.pack(expand=True, pady=8)
+        self._gsl_banner_visible = False
 
         # ── middle: candles + option setup side by side ───────────────────
         mid = ctk.CTkFrame(self, fg_color="transparent")
@@ -1328,6 +1455,16 @@ class DashboardTab(ctk.CTkFrame):
         else:
             self._lbl_pnl_pts.configure(text="-", text_color=MUTED)
             self._lbl_pnl_rs.configure(text="-", text_color=MUTED)
+
+        # ── Global SL banner ──────────────────────────────────────────────────
+        gsl_hit = any("GLOBAL SL HIT" in str(ev) for ev in (events or []))
+        if gsl_hit and not self._gsl_banner_visible:
+            self._gsl_banner.pack(fill="x", padx=12, pady=(0, 4))
+            self._gsl_banner_visible = True
+        elif not gsl_hit and self._gsl_banner_visible:
+            # Hide on new day (events list won't have yesterday's events)
+            self._gsl_banner.pack_forget()
+            self._gsl_banner_visible = False
 
         # candle table
         self._candle_box.configure(state="normal")
