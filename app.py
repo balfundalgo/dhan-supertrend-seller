@@ -336,11 +336,11 @@ class StrategyBridge:
 
         def _actionable_trend():
             s = signal_engine.snapshot()
-            if s.get("active") == "SHORT_PUT": return "BUY"
+            if s.get("active") == "SHORT_PUT":  return "BUY"
             if s.get("active") == "SHORT_CALL": return "SELL"
             t = str(s.get("trend") or "").upper()
-            if t in ("BUY","SELL") and s.get("signal_candle_high") is not None:
-                return t
+            if t in ("BUY", "SELL"):
+                return t   # trend alone is enough for entry discovery
             return None
 
         def _discover(*, spot, trend, prefix, epoch=None):
@@ -374,20 +374,31 @@ class StrategyBridge:
         candles_1m, hmsg = fetch_intraday_1m_history(
             client_id=client_id, access_token=access_token,
             security_id=sid, exchange_segment=seg,
-            lookback_days=5, limit=1500, instrument="INDEX",
+            lookback_days=30, limit=5000, instrument="INDEX",
         )
         self.post_event(hmsg)
         log(hmsg)
         if candles_1m:
             n_tf = candle_builder.seed_from_1m_history(candles_1m)
-            self.post_event(f"Seeded {n_tf} candles")
+            self.post_event(f"Seeded {n_tf} x {tf}m candles")
             log(f"Seeded {n_tf} x {tf}m candles from {len(candles_1m)} x 1m bars")
             hist_list = list(reversed(candle_builder.snapshot().get("history",[])))
             for c in hist_list:
                 r = st_engine.update(c)
                 signal_engine.process_historical_candle(c, r)
             state_manager.mark_indicator_seeded()
-            # Log final state after warmup
+
+            # ── Reconcile startup state ────────────────────────────────────
+            # If no flip found in history window, seed active state from
+            # current trend so the system can enter trades immediately.
+            reconcile_msg = signal_engine.reconcile_startup_state(
+                bootstrap_current_trend=True
+            )
+            if reconcile_msg:
+                self.post_event(f"Startup reconcile: {reconcile_msg}")
+                log(f"RECONCILE: {reconcile_msg}")
+
+            # Log final state after warmup + reconcile
             sig_snap = signal_engine.snapshot()
             log(f"Post-warmup | trend={sig_snap.get('trend')} | signal={sig_snap.get('signal')} | "
                 f"active={sig_snap.get('active')} | sig_hi={sig_snap.get('signal_candle_high')} | "

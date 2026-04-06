@@ -292,6 +292,13 @@ def main() -> int:
 
         state_manager.mark_indicator_seeded()
 
+        # ── Reconcile startup state ────────────────────────────────────────────
+        # If no flip found in history window, seed active state from current trend
+        # so the system can enter trades immediately without waiting for a live flip.
+        reconcile_msg = signal_engine.reconcile_startup_state(bootstrap_current_trend=True)
+        if reconcile_msg:
+            dash_state.add_event(f"Startup reconcile: {reconcile_msg}")
+
         # ── Variant 5: also seed LTF candle builder ───────────────────────────
         if cfg.variant == 5 and ltf_candle_builder is not None and dual_tf_engine is not None:
             seeded_ltf = ltf_candle_builder.seed_from_1m_history(candles_1m)
@@ -338,8 +345,7 @@ def main() -> int:
 
         current_trend = str(sig_snap.get("trend") or "").upper().strip()
         if current_trend in ("BUY", "SELL"):
-            if sig_snap.get("signal_candle_high") is not None and sig_snap.get("signal_candle_low") is not None:
-                return current_trend
+            return current_trend   # trend alone is enough for entry discovery
         return None
 
     def _attempt_option_discovery(*, spot_price: float, trend: str, event_prefix: str, candle_epoch=None) -> None:

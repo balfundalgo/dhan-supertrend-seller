@@ -148,12 +148,12 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     history_lookback_days = (
         args.history_lookback_days
         if args.history_lookback_days is not None
-        else int(os.getenv("HISTORY_LOOKBACK_DAYS", "5"))
+        else int(os.getenv("HISTORY_LOOKBACK_DAYS", "30"))
     )
     history_limit = (
         args.history_limit
         if args.history_limit is not None
-        else int(os.getenv("HISTORY_LIMIT", "1500"))
+        else int(os.getenv("HISTORY_LIMIT", "5000"))
     )
 
     # Phase 3 config
