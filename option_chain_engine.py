@@ -254,7 +254,7 @@ class OptionChainEngine:
         expiry: str,
         spot_price: float,
         trend: str,
-        otm_steps: Tuple[int, ...],
+        otm_steps: Tuple[int, ...],   # kept for signature compat — min start step = otm_steps[0] or 3
         rule_cfg: PremiumRuleConfig,
         expiry_bucket_type: str = "current",
     ) -> Tuple[Optional[OptionSetup], str]:
@@ -274,43 +274,81 @@ class OptionChainEngine:
         atm = self.compute_atm_strike(spot_price)
         opt_type = "PE" if trend == "BUY" else "CE"
 
-        # Strategy: 100 pts per OTM step for current/next month, 500 for far month
+        # Rounding rule: 100pts/step for current/next month, 500pts/step for far month
         otm_offset = 500 if str(expiry_bucket_type).lower() == "far" else 100
 
-        debug_lines = [chain_msg, f"ATM={atm:.0f}", f"OptionType={opt_type}", f"OTMOffset={otm_offset}pts/step"]
+        # Minimum starting OTM step (always 3, or first value in otm_steps)
+        min_step = int(otm_steps[0]) if otm_steps else 3
 
-        for step in otm_steps:
-            step = int(step)
-            strike = (atm - step * otm_offset) if opt_type == "PE" else (atm + step * otm_offset)
+        debug_lines = [
+            chain_msg,
+            f"ATM={atm:.0f}",
+            f"OptionType={opt_type}",
+            f"OTMOffset={otm_offset}pts/step",
+            f"WalkFrom={min_step}OTM outward",
+        ]
+
+        # ── Build sorted list of all valid round-figure OTM strikes from chain ──
+        # A strike is valid if:
+        #   1. It is OTM relative to ATM (lower for PE, higher for CE)
+        #   2. It is a round figure (multiple of otm_offset)
+        #   3. It is at least min_step * otm_offset away from ATM
+        #   4. It exists in the option chain
+
+        otm_strikes = []  # list of (step_number, strike_value)
+        for strike_key in oc.keys():
+            sv = self._safe_float(strike_key)
+            if sv is None:
+                continue
+            # Must be round figure (multiple of otm_offset)
+            if abs(round(sv / otm_offset) * otm_offset - sv) > 0.01:
+                continue
+            if opt_type == "PE":
+                if sv >= atm:
+                    continue
+                step = int(round((atm - sv) / otm_offset))
+            else:  # CE
+                if sv <= atm:
+                    continue
+                step = int(round((sv - atm) / otm_offset))
+            if step < min_step:
+                continue
+            otm_strikes.append((step, sv))
+
+        # Walk outward from min_step
+        otm_strikes.sort(key=lambda x: x[0])
+
+        for step, strike in otm_strikes:
             strike_key = f"{float(strike):.6f}"
-
             row = oc.get(strike_key)
             if not isinstance(row, dict):
-                debug_lines.append(f"{step}OTM {opt_type} {strike:.0f}: strike missing in chain")
+                debug_lines.append(f"{step}OTM {opt_type} {strike:.0f}: missing in chain")
                 continue
 
             leg = row.get(opt_type.lower(), {})
             if not isinstance(leg, dict):
-                debug_lines.append(f"{step}OTM {opt_type} {strike:.0f}: leg missing in chain")
+                debug_lines.append(f"{step}OTM {opt_type} {strike:.0f}: leg missing")
                 continue
 
-            short_lp = self._safe_float(leg.get("last_price"))
+            short_lp  = self._safe_float(leg.get("last_price"))
             short_sid = str(leg.get("security_id", "")).strip()
 
             if short_lp is None:
-                debug_lines.append(f"{step}OTM {opt_type} {strike:.0f}: short premium missing")
+                debug_lines.append(f"{step}OTM {opt_type} {strike:.0f}: premium missing")
                 continue
 
             if short_lp < rule_cfg.min_short_premium:
                 debug_lines.append(
-                    f"{step}OTM {opt_type} {strike:.0f}: short premium {short_lp:.2f} below min {rule_cfg.min_short_premium:.2f}"
+                    f"{step}OTM {opt_type} {strike:.0f}: short={short_lp:.2f} below min {rule_cfg.min_short_premium:.2f}"
                 )
-                continue
+                # Going further OTM will only be cheaper — stop searching this expiry
+                break
 
             if short_lp > rule_cfg.max_short_premium:
                 debug_lines.append(
-                    f"{step}OTM {opt_type} {strike:.0f}: short premium {short_lp:.2f} above max {rule_cfg.max_short_premium:.2f}"
+                    f"{step}OTM {opt_type} {strike:.0f}: short={short_lp:.2f} above max {rule_cfg.max_short_premium:.2f}"
                 )
+                # Keep walking — next strike will be cheaper
                 continue
 
             short_leg = ChainLeg(
@@ -328,11 +366,12 @@ class OptionChainEngine:
                 short_strike=float(strike),
                 option_type=opt_type,
                 rule_cfg=rule_cfg,
+                otm_offset=otm_offset,
             )
 
             if hedge_leg is None:
                 debug_lines.append(
-                    f"{step}OTM {opt_type} {strike:.0f}: hedge rejected | {hedge_reason}"
+                    f"{step}OTM {opt_type} {strike:.0f}: short OK @ {short_lp:.2f} | hedge rejected — {hedge_reason}"
                 )
                 continue
 
@@ -356,7 +395,7 @@ class OptionChainEngine:
                     hedge_distance_steps=hedge_steps,
                 ),
                 (
-                    f"Valid option setup found | "
+                    f"Valid setup | "
                     f"short={short_leg.trading_symbol} @ {short_leg.last_price:.2f} | "
                     f"hedge={hedge_leg.trading_symbol} @ {hedge_leg.last_price:.2f} | "
                     f"net={net_credit:.2f}"
@@ -380,7 +419,13 @@ class OptionChainEngine:
         short_strike: float,
         option_type: str,
         rule_cfg: PremiumRuleConfig,
+        otm_offset: int = 100,
     ) -> Tuple[Optional[ChainLeg], int, str]:
+        """
+        Walk all strikes further OTM than short_strike (in ascending distance order).
+        Only consider round-figure strikes (multiples of otm_offset).
+        Return first strike whose premium is within hedge premium rules.
+        """
         option_type = option_type.upper().strip()
         candidates = []
 
@@ -391,10 +436,14 @@ class OptionChainEngine:
             if strike_val is None:
                 continue
 
+            # Must be round figure (multiple of otm_offset)
+            if abs(round(strike_val / otm_offset) * otm_offset - strike_val) > 0.01:
+                continue
+
             if option_type == "PE" and strike_val < short_strike:
-                diff_steps = int(round((short_strike - strike_val) / self.strike_step))
+                diff_steps = int(round((short_strike - strike_val) / otm_offset))
             elif option_type == "CE" and strike_val > short_strike:
-                diff_steps = int(round((strike_val - short_strike) / self.strike_step))
+                diff_steps = int(round((strike_val - short_strike) / otm_offset))
             else:
                 continue
 
@@ -402,28 +451,31 @@ class OptionChainEngine:
             if not isinstance(leg, dict):
                 continue
 
-            lp = self._safe_float(leg.get("last_price"))
+            lp  = self._safe_float(leg.get("last_price"))
             sid = str(leg.get("security_id", "")).strip()
             if lp is None:
                 continue
 
             candidates.append((diff_steps, strike_val, sid, lp))
 
+        # Sort by distance — closest first (walk outward)
         candidates.sort(key=lambda x: x[0])
 
         reject_logs = []
 
         for diff_steps, strike_val, sid, lp in candidates:
-            if lp < rule_cfg.min_hedge_premium:
-                reject_logs.append(
-                    f"hedge {option_type} {strike_val:.0f} premium={lp:.2f} below min {rule_cfg.min_hedge_premium:.2f}"
-                )
-                continue
             if lp > rule_cfg.max_hedge_premium:
                 reject_logs.append(
-                    f"hedge {option_type} {strike_val:.0f} premium={lp:.2f} above max {rule_cfg.max_hedge_premium:.2f}"
+                    f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} above max {rule_cfg.max_hedge_premium:.2f}"
                 )
+                # Keep walking — further OTM will be cheaper
                 continue
+            if lp < rule_cfg.min_hedge_premium:
+                reject_logs.append(
+                    f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} below min {rule_cfg.min_hedge_premium:.2f}"
+                )
+                # Further OTM will be even cheaper — stop
+                break
 
             return (
                 ChainLeg(
@@ -439,7 +491,7 @@ class OptionChainEngine:
             )
 
         if not candidates:
-            return None, 0, "no farther OTM hedge candidates found"
+            return None, 0, "no further OTM hedge candidates found"
 
         return None, 0, "; ".join(reject_logs) if reject_logs else "no hedge matched premium rules"
 
