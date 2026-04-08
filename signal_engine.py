@@ -55,42 +55,46 @@ class SignalEngine:
         self.state_manager.set_last_closed_candle(candle_epoch)
 
     def reconcile_startup_state(self, bootstrap_current_trend: bool = True) -> Optional[str]:
+        """
+        Seed signal candle high/low from history so exit conditions work correctly.
+        Does NOT set active=SHORT_PUT/CALL — that would cause phantom exit triggers
+        if the reconciled signal candle low/high is breached before a real position opens.
+        _actionable_trend() uses trend directly so active is not needed for entry.
+        """
         state = self.state_manager.state
-        desired_active = self._active_from_trend(self.current_trend)
-        current_active = state.active
 
         if self.current_trend not in ("BUY", "SELL"):
             return None
 
-        if current_active == desired_active and not state.waiting_reentry:
-            return None
+        prev_active   = state.active
+        prev_signal   = state.last_signal
+        prev_waiting  = state.waiting_reentry
 
-        prev_active = current_active
-        prev_signal = state.last_signal
-        prev_waiting = state.waiting_reentry
-
-        # Clear stale opposite-side / re-entry carryover.
+        # Clear stale opposite-side carryover
         if prev_signal != self.current_trend:
             self.state_manager.clear_signal_context()
 
         if bootstrap_current_trend:
+            # Seed sig_hi/lo from history BUT keep active=None
+            # This prevents phantom exit triggers before first real position opens
             self.state_manager.seed_trend_context(
                 trend=str(self.current_trend),
-                active=desired_active,
+                active=None,          # ← do NOT set active
                 candle_high=state.signal_candle_high,
                 candle_low=state.signal_candle_low,
                 candle_epoch=state.signal_candle_epoch,
             )
+            # Also clear waiting_reentry in case it was set from a previous session
+            self.state_manager.set_waiting_reentry(False)
         else:
             self.state_manager.clear_lifecycle(keep_last_event=False)
 
         reason = (
-            f"Startup reconcile reset: current trend={self.current_trend} | "
-            f"prev_active={prev_active or '-'} | prev_signal={prev_signal or '-'} | "
-            f"prev_waiting={'YES' if prev_waiting else 'NO'} | "
-            f"bootstrap_active={desired_active or '-'}"
+            f"Startup reconcile: trend={self.current_trend} | "
+            f"sig_hi={state.signal_candle_high} | sig_lo={state.signal_candle_low} | "
+            f"prev_active={prev_active or '-'} | prev_waiting={'YES' if prev_waiting else 'NO'} | "
+            f"active kept=None (phantom exit prevention)"
         )
-        self.state_manager.set_last_event(reason)
         return reason
 
     def process_live_closed_candle(self, candle: Dict[str, Any], st_result: Dict[str, Any]) -> List[str]:
