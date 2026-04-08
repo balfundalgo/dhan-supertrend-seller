@@ -75,16 +75,18 @@ class SignalEngine:
             self.state_manager.clear_signal_context()
 
         if bootstrap_current_trend:
-            # Seed sig_hi/lo from history BUT keep active=None
-            # This prevents phantom exit triggers before first real position opens
+            # Seed sig_hi/lo from history BUT force active=None
+            # seed_trend_context skips None active, so call set_active separately
             self.state_manager.seed_trend_context(
                 trend=str(self.current_trend),
-                active=None,          # ← do NOT set active
+                active=None,
                 candle_high=state.signal_candle_high,
                 candle_low=state.signal_candle_low,
                 candle_epoch=state.signal_candle_epoch,
             )
-            # Also clear waiting_reentry in case it was set from a previous session
+            # Explicitly force active to None — prevents phantom exit triggers
+            self.state_manager.set_active(None)
+            # Clear waiting_reentry from any previous session state
             self.state_manager.set_waiting_reentry(False)
         else:
             self.state_manager.clear_lifecycle(keep_last_event=False)
