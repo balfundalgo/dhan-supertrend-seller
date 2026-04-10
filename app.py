@@ -141,7 +141,9 @@ class StrategyBridge:
         from strategy_logger import (
             log, log_debug, log_warn, log_error, log_section,
             log_config, log_candle, log_signal_state,
-            log_option_snap, log_paper_snap, log_tick, get_log_path
+            log_option_snap, log_paper_snap, log_tick,
+            log_trade_open, log_trade_close,
+            get_log_path, get_trade_log_path
         )
         from datetime import timezone, timedelta
         from typing import Optional as Opt
@@ -167,6 +169,9 @@ class StrategyBridge:
 
         try:
             self.post_event(f"Log file: {get_log_path()}")
+            self.post_event(f"Trade log: {get_trade_log_path()}")
+            log(f"Activity log: {get_log_path()}")
+            log(f"Trade log: {get_trade_log_path()}")
         except Exception:
             pass
 
@@ -288,6 +293,7 @@ class StrategyBridge:
                     close_msg = paper_mgr.close_active_position("Global daily SL hit")
                     self.post_event(close_msg)
                     log(f"GLOBAL SL CLOSE: {close_msg}")
+                    log_trade_close(paper_mgr.snapshot(), exit_reason="Global daily SL hit")
                     _sync_ws()
                 return True
 
@@ -308,6 +314,7 @@ class StrategyBridge:
                         self.post_event(msg)
                         log(f"SL CLOSE: {msg}")
                         log_paper_snap(paper_mgr.snapshot())
+                        log_trade_close(paper_mgr.snapshot(), exit_reason=f"V{var}: SL breached on live tick")
                         _sync_ws()
                         if var == 1:
                             v1_exit_today = True
@@ -357,6 +364,7 @@ class StrategyBridge:
                 log(f"PAPER OPEN: {msg}")
                 _sync_ws()
                 log_paper_snap(paper_mgr.snapshot())
+                log_trade_open(paper_mgr.snapshot())
             else:
                 log_warn(f"No setup found — reason: {reason}")
                 log_option_snap(bridge_obj.snapshot())
@@ -499,6 +507,7 @@ class StrategyBridge:
                         msg = paper_mgr.close_active_position("V1: 9:30 gap-up SL check")
                         self.post_event(msg)
                         log(f"V1 9:30 SL close: {msg}")
+                        log_trade_close(paper_mgr.snapshot(), exit_reason="V1: 9:30 gap-up SL check")
                         _sync_ws()
                         v1_exit_today = True
 
@@ -519,6 +528,7 @@ class StrategyBridge:
                         msg = paper_mgr.close_active_position("Rollover close")
                         self.post_event(msg)
                         log(f"Rollover close: {msg}")
+                        log_trade_close(paper_mgr.snapshot(), exit_reason=f"Rollover V{rv}")
                         _sync_ws()
                     trend = _actionable_trend()
                     if trend and price:
@@ -566,6 +576,7 @@ class StrategyBridge:
                             msg = paper_mgr.close_active_position(reason)
                             self.post_event(msg)
                             log(f"PAPER CLOSE: {msg}")
+                            log_trade_close(paper_mgr.snapshot(), exit_reason=reason)
                             _sync_ws()
                             if var == 1:
                                 v1_exit_today = True
@@ -615,6 +626,7 @@ class StrategyBridge:
                             msg = paper_mgr.close_active_position(reason)
                             self.post_event(msg)
                             log(f"PAPER CLOSE (LTF): {msg}")
+                            log_trade_close(paper_mgr.snapshot(), exit_reason=reason)
                             _sync_ws()
                     last_active = cur_active
 
@@ -1411,6 +1423,9 @@ class DashboardTab(ctk.CTkFrame):
         self._log_path_lbl = _label(evhdr, "Log: not started", color=MUTED,
                                     font=("Segoe UI", 9))
         self._log_path_lbl.pack(side="right")
+        self._trade_log_lbl = _label(evhdr, "", color=MUTED,
+                                     font=("Segoe UI", 9))
+        self._trade_log_lbl.pack(side="right", padx=(0, 12))
 
         self._event_box = ctk.CTkTextbox(
             ecard, height=160, fg_color=PANEL_BG, text_color=MUTED,
@@ -1556,10 +1571,12 @@ class DashboardTab(ctk.CTkFrame):
         # update log file path label from events
         try:
             for ev in (events or []):
-                if "Log file:" in ev:
-                    path = ev.split("Log file:")[-1].strip()
+                if "Activity log:" in ev or "Log file:" in ev:
+                    path = ev.split(":")[-1].strip()
                     self._log_path_lbl.configure(text=f"Log: {path}", text_color=GREEN)
-                    break
+                if "Trade log:" in ev:
+                    path = ev.split("Trade log:")[-1].strip()
+                    self._trade_log_lbl.configure(text=f"Trades: {path}", text_color=GREEN)
         except Exception:
             pass
 
