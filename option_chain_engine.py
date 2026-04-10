@@ -478,36 +478,30 @@ class OptionChainEngine:
         for diff_steps, strike_val, sid, lp in candidates:
             net_credit = short_premium - lp
 
-            # Hedge too expensive — keep walking outward (cheaper further out)
+            # Hedge too expensive — keep walking (further OTM = cheaper)
             if lp > rule_cfg.max_hedge_premium:
                 reject_logs.append(
                     f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} above max {rule_cfg.max_hedge_premium:.2f}"
                 )
                 continue
 
-            # Hedge below min_hedge floor
+            # Hedge below strict minimum floor — STOP, going further only gets worse
             if lp < rule_cfg.min_hedge_premium:
                 reject_logs.append(
-                    f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} below min {rule_cfg.min_hedge_premium:.2f}"
+                    f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} below min {rule_cfg.min_hedge_premium:.2f} — stopping"
                 )
-                # Only stop if net credit is also below minimum —
-                # going further OTM makes hedge cheaper (worse net credit)
-                # so no point continuing
-                if net_credit < rule_cfg.min_net_credit:
-                    break
-                # net credit already passes — accept this hedge despite low premium
-                # (user set min_hedge too strict for current market)
+                break
 
-            # Net credit check
+            # Hedge premium is valid but net credit not enough yet
+            # Keep walking further OTM — cheaper hedge = higher net credit
             if net_credit < rule_cfg.min_net_credit:
                 reject_logs.append(
                     f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} | "
-                    f"net credit {net_credit:.2f} below min {rule_cfg.min_net_credit:.2f} — walking further"
+                    f"net={net_credit:.2f} below min {rule_cfg.min_net_credit:.2f} — walking further"
                 )
-                # Keep walking — cheaper hedge = higher net credit
                 continue
 
-            # ── Valid hedge found ──
+            # ── Both conditions pass → valid hedge ──
             return (
                 ChainLeg(
                     security_id=sid,
