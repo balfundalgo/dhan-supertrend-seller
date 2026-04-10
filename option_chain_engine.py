@@ -364,6 +364,7 @@ class OptionChainEngine:
                 oc=oc,
                 expiry=expiry,
                 short_strike=float(strike),
+                short_premium=float(short_lp),
                 option_type=opt_type,
                 rule_cfg=rule_cfg,
                 otm_offset=otm_offset,
@@ -417,14 +418,25 @@ class OptionChainEngine:
         oc: Dict[str, Any],
         expiry: str,
         short_strike: float,
+        short_premium: float,
         option_type: str,
         rule_cfg: PremiumRuleConfig,
         otm_offset: int = 100,
     ) -> Tuple[Optional[ChainLeg], int, str]:
         """
-        Walk all strikes further OTM than short_strike (in ascending distance order).
+        Walk all strikes further OTM than short_strike outward.
         Only consider round-figure strikes (multiples of otm_offset).
-        Return first strike whose premium is within hedge premium rules.
+
+        Key logic:
+        - Walk from closest OTM outward
+        - Skip if hedge premium above max_hedge (too expensive)
+        - Stop walking when hedge premium drops below min_hedge AND
+          net_credit (short - hedge) is still below min_net_credit
+          (going further OTM only makes hedge cheaper = higher net credit,
+           so if net credit is already >= min_net_credit we stop at first valid)
+        - Accept first hedge where:
+            min_hedge <= hedge_premium <= max_hedge
+            AND net_credit >= min_net_credit
         """
         option_type = option_type.upper().strip()
         candidates = []
@@ -464,19 +476,38 @@ class OptionChainEngine:
         reject_logs = []
 
         for diff_steps, strike_val, sid, lp in candidates:
+            net_credit = short_premium - lp
+
+            # Hedge too expensive — keep walking outward (cheaper further out)
             if lp > rule_cfg.max_hedge_premium:
                 reject_logs.append(
                     f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} above max {rule_cfg.max_hedge_premium:.2f}"
                 )
-                # Keep walking — further OTM will be cheaper
                 continue
+
+            # Hedge below min_hedge floor
             if lp < rule_cfg.min_hedge_premium:
                 reject_logs.append(
                     f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} below min {rule_cfg.min_hedge_premium:.2f}"
                 )
-                # Further OTM will be even cheaper — stop
-                break
+                # Only stop if net credit is also below minimum —
+                # going further OTM makes hedge cheaper (worse net credit)
+                # so no point continuing
+                if net_credit < rule_cfg.min_net_credit:
+                    break
+                # net credit already passes — accept this hedge despite low premium
+                # (user set min_hedge too strict for current market)
 
+            # Net credit check
+            if net_credit < rule_cfg.min_net_credit:
+                reject_logs.append(
+                    f"hedge {option_type} {strike_val:.0f} @ {lp:.2f} | "
+                    f"net credit {net_credit:.2f} below min {rule_cfg.min_net_credit:.2f} — walking further"
+                )
+                # Keep walking — cheaper hedge = higher net credit
+                continue
+
+            # ── Valid hedge found ──
             return (
                 ChainLeg(
                     security_id=sid,
@@ -487,13 +518,13 @@ class OptionChainEngine:
                     expiry_text=expiry,
                 ),
                 diff_steps,
-                f"hedge selected {strike_val:.0f} @ {lp:.2f}",
+                f"hedge selected {strike_val:.0f} @ {lp:.2f} | net={net_credit:.2f}",
             )
 
         if not candidates:
             return None, 0, "no further OTM hedge candidates found"
 
-        return None, 0, "; ".join(reject_logs) if reject_logs else "no hedge matched premium rules"
+        return None, 0, "; ".join(reject_logs) if reject_logs else "no hedge matched rules"
 
     def _synthetic_symbol(self, expiry: str, strike: float, option_type: str) -> str:
         return f"NIFTY {expiry} {int(round(strike))} {option_type}"
