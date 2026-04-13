@@ -139,12 +139,15 @@ class StrategyBridge:
         from state_manager import StateManager
         from supertrend_engine import SupertrendEngine
         from strategy_logger import (
+            setup_logger,
             log, log_debug, log_warn, log_error, log_section,
             log_config, log_candle, log_signal_state,
             log_option_snap, log_paper_snap, log_tick,
             log_trade_open, log_trade_close,
             get_log_path, get_trade_log_path
         )
+        # Initialise logger for this session
+        setup_logger()
         from datetime import timezone, timedelta
         from typing import Optional as Opt
 
