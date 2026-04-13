@@ -353,7 +353,7 @@ class StrategyBridge:
             return None
 
         def _discover(*, spot, trend, prefix, epoch=None):
-            nonlocal last_disc_epoch
+            nonlocal last_disc_epoch, last_active
             log_section(f"OPTION DISCOVERY — {prefix.upper()}")
             log(f"Attempting discovery | spot={spot:.2f} | trend={trend} | prefix={prefix}")
             log_signal_state(signal_engine.snapshot())
@@ -364,9 +364,19 @@ class StrategyBridge:
                 msg = paper_mgr.open_position(setup, spot_price=spot, sl_percent=slp)
                 self.post_event(msg)
                 log(f"PAPER OPEN: {msg}")
-                _sync_ws()
-                log_paper_snap(paper_mgr.snapshot())
-                log_trade_open(paper_mgr.snapshot())
+                # Only sync state and log trade if position actually opened
+                # (paper_mgr returns "skipped" message if already active)
+                if paper_mgr.has_active():
+                    pos = paper_mgr.snapshot().get("active_position") or {}
+                    pos_trend = pos.get("trend", "")
+                    # Sync last_active so exit gate works on next candle close
+                    if pos_trend == "BUY":
+                        last_active = "SHORT_PUT"
+                    elif pos_trend == "SELL":
+                        last_active = "SHORT_CALL"
+                    _sync_ws()
+                    log_paper_snap(paper_mgr.snapshot())
+                    log_trade_open(paper_mgr.snapshot())
             else:
                 log_warn(f"No setup found — reason: {reason}")
                 log_option_snap(bridge_obj.snapshot())
@@ -472,7 +482,6 @@ class StrategyBridge:
         def on_tick(price, ltt_epoch):
             nonlocal v1_exit_today, _930_done, _rollover_done, last_flip, last_active, boot_done
             nonlocal _global_sl_hit, _global_sl_date
-
             if self._stop_event.is_set():
                 return
 
@@ -594,6 +603,24 @@ class StrategyBridge:
                         log(f"FLIP SIGNAL detected: {flip} | v1_gate={var==1 and v1_exit_today and not _after_1015()}")
                         if not (var == 1 and v1_exit_today and not _after_1015()):
                             if not _check_global_sl():
+                                # ── Close opposite position before opening new one ──
+                                if paper_mgr.has_active():
+                                    pos = paper_mgr.snapshot().get("active_position") or {}
+                                    pos_trend = pos.get("trend", "")
+                                    # Close if opposite direction
+                                    opposite = (flip == "BUY" and pos_trend == "SELL") or \
+                                               (flip == "SELL" and pos_trend == "BUY")
+                                    if opposite:
+                                        flip_close_reason = sig.get("last_event") or f"Flip to {flip}"
+                                        _pre_close_snap = paper_mgr.snapshot()
+                                        close_msg = paper_mgr.close_active_position(flip_close_reason)
+                                        self.post_event(close_msg)
+                                        log(f"FLIP CLOSE (opposite side): {close_msg}")
+                                        log_trade_close(_pre_close_snap, exit_reason=flip_close_reason)
+                                        _sync_ws()
+                                        last_active = None
+                                        if var == 1:
+                                            v1_exit_today = True
                                 _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
                         else:
                             log_warn(f"Flip discovery blocked — V1 exit today and before 10:15 AM")
