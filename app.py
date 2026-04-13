@@ -290,10 +290,11 @@ class StrategyBridge:
                 self.post_event(msg)
                 log(f"GLOBAL SL: {msg}")
                 if paper_mgr.has_active():
+                    _pre_close_snap = paper_mgr.snapshot()
                     close_msg = paper_mgr.close_active_position("Global daily SL hit")
                     self.post_event(close_msg)
                     log(f"GLOBAL SL CLOSE: {close_msg}")
-                    log_trade_close(paper_mgr.snapshot(), exit_reason="Global daily SL hit")
+                    log_trade_close(_pre_close_snap, exit_reason="Global daily SL hit")
                     _sync_ws()
                 return True
 
@@ -308,13 +309,14 @@ class StrategyBridge:
                 if var in (1, 4) and paper_mgr.has_active():
                     pos = paper_mgr.snapshot().get("active_position") or {}
                     if pos.get("short_sl_hit"):
+                        _pre_close_snap = paper_mgr.snapshot()
                         msg = paper_mgr.close_active_position(
                             f"Variant {var}: SL breached on live tick"
                         )
                         self.post_event(msg)
                         log(f"SL CLOSE: {msg}")
                         log_paper_snap(paper_mgr.snapshot())
-                        log_trade_close(paper_mgr.snapshot(), exit_reason=f"V{var}: SL breached on live tick")
+                        log_trade_close(_pre_close_snap, exit_reason=f"V{var}: SL breached on live tick")
                         _sync_ws()
                         if var == 1:
                             v1_exit_today = True
@@ -504,10 +506,11 @@ class StrategyBridge:
                 if paper_mgr.has_active():
                     pos = paper_mgr.snapshot().get("active_position") or {}
                     if pos.get("short_sl_hit"):
+                        _pre_close_snap = paper_mgr.snapshot()
                         msg = paper_mgr.close_active_position("V1: 9:30 gap-up SL check")
                         self.post_event(msg)
                         log(f"V1 9:30 SL close: {msg}")
-                        log_trade_close(paper_mgr.snapshot(), exit_reason="V1: 9:30 gap-up SL check")
+                        log_trade_close(_pre_close_snap, exit_reason="V1: 9:30 gap-up SL check")
                         _sync_ws()
                         v1_exit_today = True
 
@@ -525,10 +528,11 @@ class StrategyBridge:
                     self.post_event(f"Rollover V{rv} triggered @ 3 PM IST")
                     log(f"ROLLOVER V{rv} triggered")
                     if paper_mgr.has_active():
+                        _pre_close_snap = paper_mgr.snapshot()
                         msg = paper_mgr.close_active_position("Rollover close")
                         self.post_event(msg)
                         log(f"Rollover close: {msg}")
-                        log_trade_close(paper_mgr.snapshot(), exit_reason=f"Rollover V{rv}")
+                        log_trade_close(_pre_close_snap, exit_reason=f"Rollover V{rv}")
                         _sync_ws()
                     trend = _actionable_trend()
                     if trend and price:
@@ -573,10 +577,11 @@ class StrategyBridge:
                     if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
                         if paper_mgr.has_active():
                             reason = sig.get("last_event") or "Signal exit"
+                            _pre_close_snap = paper_mgr.snapshot()
                             msg = paper_mgr.close_active_position(reason)
                             self.post_event(msg)
                             log(f"PAPER CLOSE: {msg}")
-                            log_trade_close(paper_mgr.snapshot(), exit_reason=reason)
+                            log_trade_close(_pre_close_snap, exit_reason=reason)
                             _sync_ws()
                             if var == 1:
                                 v1_exit_today = True
@@ -623,10 +628,11 @@ class StrategyBridge:
                     if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
                         if paper_mgr.has_active():
                             reason = sig.get("last_event") or "LTF exit"
+                            _pre_close_snap = paper_mgr.snapshot()
                             msg = paper_mgr.close_active_position(reason)
                             self.post_event(msg)
                             log(f"PAPER CLOSE (LTF): {msg}")
-                            log_trade_close(paper_mgr.snapshot(), exit_reason=reason)
+                            log_trade_close(_pre_close_snap, exit_reason=reason)
                             _sync_ws()
                     last_active = cur_active
 
