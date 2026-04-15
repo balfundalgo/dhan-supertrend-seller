@@ -277,7 +277,7 @@ def log_trade_open(position_snap: dict) -> None:
 
     now        = datetime.now()
     date_str   = now.strftime("%Y-%m-%d")
-    date_key   = now.strftime("%Y%m%d")
+    date_key   = now.strftime("%Y-%m-%d")
     entry_time = now.strftime("%H:%M:%S")
 
     entry = {
@@ -346,7 +346,7 @@ def log_trade_close(position_snap: dict, exit_reason: str = "") -> None:
 
     now        = datetime.now()
     exit_time  = now.strftime("%H:%M:%S")
-    date_key   = now.strftime("%Y%m%d")
+    date_key   = now.strftime("%Y-%m-%d")
     date_str   = now.strftime("%Y-%m-%d")
 
     with _trade_lock:

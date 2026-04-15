@@ -391,6 +391,11 @@ class StrategyBridge:
             n = ist_now()
             return n.hour > 10 or (n.hour == 10 and n.minute >= 15)
 
+        def _market_is_open() -> bool:
+            """Returns True only after 09:15 IST — no trades before market opens."""
+            n = ist_now()
+            return (n.hour > 9) or (n.hour == 9 and n.minute >= 15)
+
         # ── bootstrap ─────────────────────────────────────────────────────
         log_section("BOOTSTRAP — HISTORY")
         self.post_event("Loading history...")
@@ -553,13 +558,15 @@ class StrategyBridge:
             # bootstrap discovery
             if not boot_done:
                 trend = _actionable_trend()
-                log(f"Bootstrap discovery check | actionable_trend={trend} | has_active={paper_mgr.has_active()}")
+                log(f"Bootstrap discovery check | actionable_trend={trend} | has_active={paper_mgr.has_active()} | market_open={_market_is_open()}")
                 log_signal_state(signal_engine.snapshot())
-                if trend and not paper_mgr.has_active() and not _check_global_sl():
+                if trend and not paper_mgr.has_active() and not _check_global_sl() and _market_is_open():
                     _discover(spot=float(price), trend=trend, prefix="Bootstrap")
                     last_active = signal_engine.snapshot().get("active")
                 elif not trend:
                     log_warn("Bootstrap: no actionable trend yet — waiting for signal")
+                elif not _market_is_open():
+                    log_warn("Bootstrap: market not open yet (before 09:15) — will retry on first candle close")
                 boot_done = True
 
             # ── HTF candles ───────────────────────────────────────────────────
@@ -603,14 +610,13 @@ class StrategyBridge:
                     ep  = _candle_epoch(candle)
                     flip = sig.get("signal")
                     if flip in ("BUY","SELL") and flip != last_flip:
-                        log(f"FLIP SIGNAL detected: {flip} | v1_gate={var==1 and v1_exit_today and not _after_1015()}")
+                        log(f"FLIP SIGNAL detected: {flip} | v1_gate={var==1 and v1_exit_today and not _after_1015()} | market_open={_market_is_open()}")
                         if not (var == 1 and v1_exit_today and not _after_1015()):
-                            if not _check_global_sl():
+                            if not _check_global_sl() and _market_is_open():
                                 # ── Close opposite position before opening new one ──
                                 if paper_mgr.has_active():
                                     pos = paper_mgr.snapshot().get("active_position") or {}
                                     pos_trend = pos.get("trend", "")
-                                    # Close if opposite direction
                                     opposite = (flip == "BUY" and pos_trend == "SELL") or \
                                                (flip == "SELL" and pos_trend == "BUY")
                                     if opposite:
@@ -625,6 +631,8 @@ class StrategyBridge:
                                         if var == 1:
                                             v1_exit_today = True
                                 _discover(spot=cc, trend=flip, prefix="Flip discovery", epoch=ep)
+                            elif not _market_is_open():
+                                log_warn("Flip discovery blocked — before 09:15 market open")
                         else:
                             log_warn(f"Flip discovery blocked — V1 exit today and before 10:15 AM")
                         last_flip = flip
@@ -633,9 +641,9 @@ class StrategyBridge:
 
                     if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
                         trend = _actionable_trend()
-                        log_debug(f"Flat rescan check | trend={trend} | last_disc_epoch={last_disc_epoch} | ep={ep}")
+                        log_debug(f"Flat rescan check | trend={trend} | last_disc_epoch={last_disc_epoch} | ep={ep} | market_open={_market_is_open()}")
                         if not (var == 1 and v1_exit_today and not _after_1015()):
-                            if trend and last_disc_epoch != ep and not _check_global_sl():
+                            if trend and last_disc_epoch != ep and not _check_global_sl() and _market_is_open():
                                 _discover(spot=cc, trend=trend, prefix="Flat rescan", epoch=ep)
                     elif sig.get("waiting_reentry"):
                         log_debug(f"Waiting re-entry | trend={sig.get('trend')} | sig_hi={sig.get('signal_candle_high')} | close={candle.get('close')}")
@@ -671,7 +679,7 @@ class StrategyBridge:
 
                     if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
                         trend = _actionable_trend()
-                        if trend and last_disc_epoch != ep and not _check_global_sl():
+                        if trend and last_disc_epoch != ep and not _check_global_sl() and _market_is_open():
                             _discover(spot=cc, trend=trend, prefix="V5 LTF entry", epoch=ep)
 
                     _push_snapshot()
