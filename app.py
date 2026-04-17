@@ -596,14 +596,19 @@ class StrategyBridge:
                     if last_active in ("SHORT_PUT","SHORT_CALL") and cur_active is None:
                         if paper_mgr.has_active():
                             reason = sig.get("last_event") or "Signal exit"
-                            _pre_close_snap = paper_mgr.snapshot()
-                            msg = paper_mgr.close_active_position(reason)
-                            self.post_event(msg)
-                            log(f"PAPER CLOSE: {msg}")
-                            log_trade_close(_pre_close_snap, exit_reason=reason)
-                            _sync_ws()
-                            if var == 1:
-                                v1_exit_today = True
+                            # Issue 5 fix: "Live action armed" is NOT an exit signal —
+                            # it just means the indicator finished warming up. Skip close.
+                            if "armed" in reason.lower():
+                                log_debug(f"Close gate skipped — reason is indicator armed, not an exit: {reason}")
+                            else:
+                                _pre_close_snap = paper_mgr.snapshot()
+                                msg = paper_mgr.close_active_position(reason)
+                                self.post_event(msg)
+                                log(f"PAPER CLOSE: {msg}")
+                                log_trade_close(_pre_close_snap, exit_reason=reason)
+                                _sync_ws()
+                                if var == 1:
+                                    v1_exit_today = True
                     last_active = cur_active
 
                     cc  = float(candle["close"])
@@ -639,13 +644,10 @@ class StrategyBridge:
                     elif flip in (None,"","-"):
                         last_flip = None
 
-                    if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
-                        trend = _actionable_trend()
-                        log_debug(f"Flat rescan check | trend={trend} | last_disc_epoch={last_disc_epoch} | ep={ep} | market_open={_market_is_open()}")
-                        if not (var == 1 and v1_exit_today and not _after_1015()):
-                            if trend and last_disc_epoch != ep and not _check_global_sl() and _market_is_open():
-                                _discover(spot=cc, trend=trend, prefix="Flat rescan", epoch=ep)
-                    elif sig.get("waiting_reentry"):
+                    # Issue 7 fix: Flat rescan removed.
+                    # Per strategy doc, entries happen ONLY on a fresh Supertrend flip signal candle.
+                    # Rescanning every candle when flat causes spurious entries not in the strategy.
+                    if sig.get("waiting_reentry"):
                         log_debug(f"Waiting re-entry | trend={sig.get('trend')} | sig_hi={sig.get('signal_candle_high')} | close={candle.get('close')}")
 
                 _push_snapshot()
@@ -676,11 +678,7 @@ class StrategyBridge:
 
                     cc = float(candle["close"])
                     ep = _candle_epoch(candle)
-
-                    if not paper_mgr.has_active() and not sig.get("waiting_reentry"):
-                        trend = _actionable_trend()
-                        if trend and last_disc_epoch != ep and not _check_global_sl() and _market_is_open():
-                            _discover(spot=cc, trend=trend, prefix="V5 LTF entry", epoch=ep)
+                    # Flat rescan removed per strategy doc — entries on flip signal only
 
                     _push_snapshot()
 
