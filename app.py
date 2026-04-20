@@ -571,6 +571,21 @@ class StrategyBridge:
 
             # ── HTF candles ───────────────────────────────────────────────────
             for candle in closed:
+                # Skip pre-market candles — candle_builder dumps all pre-09:15
+                # ticks into a single "pre-open" bucket. This bucket has corrupted
+                # OHLC (stale pre-market price + real gap-up mixed together) which
+                # would blow up ATR and give wrong Supertrend values.
+                # 09:15 IST = UTC+5:30 → bucket epoch check: market opens at
+                # _MARKET_OPEN_UTC_OFFSET (13500s = 3h45m) from UTC midnight.
+                candle_bucket = int(candle.get("bucket") or candle.get("epoch") or 0)
+                if candle_bucket > 0:
+                    # Calculate 09:15 IST epoch for this candle's day
+                    day_start_utc = (candle_bucket // 86400) * 86400
+                    market_open_epoch = day_start_utc + 13500  # 09:15 IST
+                    if candle_bucket < market_open_epoch:
+                        log_debug(f"Pre-market candle skipped | bucket={candle_bucket} < market_open={market_open_epoch}")
+                        continue
+
                 r = st_engine.update(candle)
                 log_candle(f"HTF CANDLE CLOSE ({tf}m)", candle, r)
 
@@ -655,6 +670,11 @@ class StrategyBridge:
             # ── LTF candles (Variant 5 only) ──────────────────────────────────
             if var == 5 and dual_tf_engine_obj is not None:
                 for candle in ltf_closed:
+                    candle_bucket = int(candle.get("bucket") or candle.get("epoch") or 0)
+                    if candle_bucket > 0:
+                        day_start_utc = (candle_bucket // 86400) * 86400
+                        if candle_bucket < day_start_utc + 13500:
+                            continue
                     ltf_r = ltf_st_engine.update(candle)
                     log_candle(f"LTF CANDLE CLOSE ({ltf}m)", candle, ltf_r)
                     ltf_evs = dual_tf_engine_obj.process_ltf_live(candle, ltf_r)
