@@ -17,7 +17,25 @@ from dhan_token_manager import (
 
 
 def ensure_dhan_token() -> Tuple[str, str]:
-    """Return (client_id, access_token), renewing or generating token if needed."""
+    """Return (client_id, access_token).
+
+    Priority order:
+      1. Shared file from dhan-token-generator.exe (C:/balfund_shared/dhan_token.json)
+      2. Existing valid token in .env
+      3. Renew existing token
+      4. Generate fresh token via TOTP
+    """
+    from dhan_token_manager import read_shared_token
+
+    # 1. Try shared token file first
+    shared = read_shared_token()
+    if shared.get("access_token") and shared.get("client_id"):
+        cid = shared["client_id"]
+        tok = shared["access_token"]
+        if verify_token(cid, tok):
+            return cid, tok
+
+    # 2. Fall back to .env / TOTP flow
     load_dotenv(Path(ENV_FILE))
     cfg = load_config()
     client_id = cfg['client_id']

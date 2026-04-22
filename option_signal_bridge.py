@@ -61,12 +61,15 @@ class OptionSignalBridge:
             return None, self.last_reason
 
         expiry_info, msg = self.option_chain_engine.get_expiry_buckets()
+        # If empty (e.g. previous 502), force cache bust and retry once
+        if not any([expiry_info.get("current"), expiry_info.get("next"), expiry_info.get("far")]):
+            expiry_info, msg = self.option_chain_engine.get_expiry_buckets(force_refresh=True)
         self.last_expiry_info = expiry_info
 
         expiries_to_try = self._expiries_to_try(expiry_info)
         if not expiries_to_try:
             self.last_setup = None
-            self.last_reason = f"{msg} | No expiry buckets available"
+            self.last_reason = f"{msg} | No expiry buckets available — Dhan API may be down, will retry"
             return None, self.last_reason
 
         rule_cfg = PremiumRuleConfig(

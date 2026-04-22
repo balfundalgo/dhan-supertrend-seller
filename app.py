@@ -399,17 +399,48 @@ class StrategyBridge:
         # ── bootstrap ─────────────────────────────────────────────────────
         log_section("BOOTSTRAP — HISTORY")
         self.post_event("Loading history...")
-        candles_1m, hmsg = fetch_intraday_1m_history(
-            client_id=client_id, access_token=access_token,
-            security_id=sid, exchange_segment=seg,
-            lookback_days=30, limit=5000, instrument="INDEX",
-        )
+
+        # Dhan supports these intervals natively.
+        # For any other TF (e.g. 65m, 45m, 10m), fall back to 1m aggregation.
+        DHAN_SUPPORTED_INTERVALS = {1, 5, 15, 25, 30, 60}
+
+        if tf in DHAN_SUPPORTED_INTERVALS:
+            # ── Fetch at strategy TF directly (best accuracy) ─────────────
+            # Dhan's own 5m/15m/60m bars match the live WS exactly,
+            # so Supertrend from history will agree with the chart.
+            tf_bar_limit = max(500, 1500 // max(tf, 1))
+            candles_1m, hmsg = fetch_intraday_1m_history(
+                client_id=client_id, access_token=access_token,
+                security_id=sid, exchange_segment=seg,
+                lookback_days=30, limit=tf_bar_limit, instrument="INDEX",
+                interval=tf,
+            )
+            if not candles_1m:
+                # API returned nothing for this interval — fall back to 1m
+                log_warn(f"TF {tf}m fetch returned no data, falling back to 1m aggregation")
+                candles_1m, hmsg = fetch_intraday_1m_history(
+                    client_id=client_id, access_token=access_token,
+                    security_id=sid, exchange_segment=seg,
+                    lookback_days=30, limit=5000, instrument="INDEX",
+                    interval=1,
+                )
+        else:
+            # ── Non-standard TF (e.g. 65m, 45m) — aggregate from 1m ───────
+            # Dhan doesn't support this interval natively, so we fetch
+            # 1m bars and let candle_builder aggregate them into the correct TF.
+            log(f"TF {tf}m is non-standard — fetching 1m bars for aggregation")
+            candles_1m, hmsg = fetch_intraday_1m_history(
+                client_id=client_id, access_token=access_token,
+                security_id=sid, exchange_segment=seg,
+                lookback_days=30, limit=5000, instrument="INDEX",
+                interval=1,
+            )
         self.post_event(hmsg)
         log(hmsg)
         if candles_1m:
             n_tf = candle_builder.seed_from_1m_history(candles_1m)
             self.post_event(f"Seeded {n_tf} x {tf}m candles")
-            log(f"Seeded {n_tf} x {tf}m candles from {len(candles_1m)} x 1m bars")
+            log(f"Seeded {n_tf} x {tf}m candles from {len(candles_1m)} x {tf}m bars")
             hist_list = list(reversed(candle_builder.snapshot().get("history",[])))
             for c in hist_list:
                 r = st_engine.update(c)
@@ -434,12 +465,37 @@ class StrategyBridge:
 
             # Variant 5: seed LTF as well
             if var == 5 and ltf_candle_builder is not None and dual_tf_engine_obj is not None:
-                n_ltf = ltf_candle_builder.seed_from_1m_history(candles_1m)
-                self.post_event(f"V5 LTF: seeded {n_ltf} x {ltf}m candles")
-                log(f"V5 LTF seeded {n_ltf} x {ltf}m candles")
-                for c in reversed(list(ltf_candle_builder.snapshot().get("history", []))):
-                    r = ltf_st_engine.update(c)
-                    dual_tf_engine_obj.process_ltf_historical(c, r)
+                if ltf in DHAN_SUPPORTED_INTERVALS:
+                    ltf_bar_limit = max(500, 1500 // max(ltf, 1))
+                    candles_ltf, ltf_hmsg = fetch_intraday_1m_history(
+                        client_id=client_id, access_token=access_token,
+                        security_id=sid, exchange_segment=seg,
+                        lookback_days=30, limit=ltf_bar_limit, instrument="INDEX",
+                        interval=ltf,
+                    )
+                    if not candles_ltf:
+                        log_warn(f"LTF {ltf}m fetch returned no data, falling back to 1m aggregation")
+                        candles_ltf, ltf_hmsg = fetch_intraday_1m_history(
+                            client_id=client_id, access_token=access_token,
+                            security_id=sid, exchange_segment=seg,
+                            lookback_days=30, limit=5000, instrument="INDEX",
+                            interval=1,
+                        )
+                else:
+                    log(f"LTF {ltf}m is non-standard — fetching 1m bars for aggregation")
+                    candles_ltf, ltf_hmsg = fetch_intraday_1m_history(
+                        client_id=client_id, access_token=access_token,
+                        security_id=sid, exchange_segment=seg,
+                        lookback_days=30, limit=5000, instrument="INDEX",
+                        interval=1,
+                    )
+                if candles_ltf:
+                    n_ltf = ltf_candle_builder.seed_from_1m_history(candles_ltf)
+                    self.post_event(f"V5 LTF: seeded {n_ltf} x {ltf}m candles")
+                    log(f"V5 LTF seeded {n_ltf} x {ltf}m candles")
+                    for c in reversed(list(ltf_candle_builder.snapshot().get("history", []))):
+                        r = ltf_st_engine.update(c)
+                        dual_tf_engine_obj.process_ltf_historical(c, r)
                 for c in reversed(list(candle_builder.snapshot().get("history", []))):
                     r2 = st_engine.update(c)
                     dual_tf_engine_obj.process_htf_historical(c, r2)
